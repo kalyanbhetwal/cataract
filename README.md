@@ -58,9 +58,12 @@ python camera_smoke_test.py `
 ```
 
 If only one Spinnaker camera is connected, omit `--camera-serial`. The script
-prints the frame shape, data type, minimum, maximum, and mean, then saves the
-raw frame under `data/camera_test_TIMESTAMP.npy`. For a color camera, use the
-unpacked 16-bit Bayer format reported by SpinView, such as `BayerRG16`.
+prints the frame shape, data type, minimum, maximum, and mean, then saves both
+`data/camera_test_TIMESTAMP.npy` and `.png`. The NPY contains the unchanged raw
+camera values. The PNG is an 8-bit preview scaled between the frame's 1st and
+99th percentiles for convenient viewing. For a color camera, use the unpacked
+16-bit Bayer format reported by SpinView, such as `BayerRG16`; its preview is
+still the raw Bayer mosaic, not a demosaiced color image.
 
 ## 2. Install vendor software on the acquisition PC
 

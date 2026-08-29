@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from camera_smoke_test import make_preview_u8
+
 from acquire_slm_camera import (
     ExperimentConfig,
     HoloeyeSLM,
@@ -162,6 +164,16 @@ class PatternTests(unittest.TestCase):
             parser.parse_args(["--dry-run", "--camera-backend", "playerone"])
         )
         self.assertEqual(config.discard_frames, 0)
+
+    def test_camera_png_preview_scaling(self):
+        frame = np.arange(100, dtype=np.uint16).reshape(10, 10)
+        preview, low, high = make_preview_u8(frame)
+        self.assertEqual(preview.shape, frame.shape)
+        self.assertEqual(preview.dtype, np.uint8)
+        self.assertAlmostEqual(low, 0.99)
+        self.assertAlmostEqual(high, 98.01)
+        self.assertEqual(int(preview[0, 0]), 0)
+        self.assertEqual(int(preview[-1, -1]), 255)
 
 
 if __name__ == "__main__":
