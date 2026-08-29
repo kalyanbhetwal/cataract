@@ -1,10 +1,15 @@
 import math
+import sys
+import tempfile
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 
 from acquire_slm_camera import (
     ExperimentConfig,
+    HoloeyeSLM,
     NeuWSPatternGenerator,
     noll_indices,
     phase_to_u8,
@@ -32,6 +37,7 @@ def test_config(seed=7):
         pixel_format="Mono16",
         camera_serial=None,
         slm_preselect=None,
+        heds_examples_dir=None,
         heds_api_major=4,
         heds_api_minor=2,
         magnification=3.57,
@@ -79,6 +85,20 @@ class PatternTests(unittest.TestCase):
         processed = process_neuws_frame(frame, magnification=2.0, crop_size=32)
         self.assertEqual(processed.shape, (32, 32))
         self.assertEqual(processed.dtype, np.uint16)
+
+    def test_explicit_heds_examples_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            examples_dir = Path(directory)
+            (examples_dir / "HEDS").mkdir()
+            config = replace(test_config(), heds_examples_dir=directory)
+            slm = HoloeyeSLM(config)
+            original_path = list(sys.path)
+            try:
+                detected = slm._prepare_heds_import_path()
+                self.assertEqual(detected, examples_dir)
+                self.assertEqual(sys.path[0], str(examples_dir.resolve()))
+            finally:
+                sys.path[:] = original_path
 
 
 if __name__ == "__main__":

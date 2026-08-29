@@ -43,6 +43,7 @@ class ExperimentConfig:
     pixel_format: str
     camera_serial: Optional[str]
     slm_preselect: Optional[str]
+    heds_examples_dir: Optional[str]
     heds_api_major: int
     heds_api_minor: int
     magnification: float
@@ -235,8 +236,7 @@ class HoloeyeSLM:
         self.slm: Any = None
         self.sdk_initialized = False
 
-    @staticmethod
-    def _check_error(error: Any, operation: str) -> None:
+    def _check_error(self, error: Any, operation: str) -> None:
         if error is None:
             return
         try:
@@ -244,12 +244,66 @@ class HoloeyeSLM:
         except (TypeError, ValueError):
             code = 0 if not error else -1
         if code != 0:
-            raise RuntimeError(f"HOLOEYE {operation} failed with error {error}")
+            description = str(error)
+            if (
+                self.module is not None
+                and hasattr(self.module, "SDK")
+                and hasattr(self.module.SDK, "ErrorString")
+            ):
+                try:
+                    description = str(self.module.SDK.ErrorString(error))
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"HOLOEYE {operation} failed with code {error}: {description}"
+            )
+
+    def _prepare_heds_import_path(self) -> Optional[Path]:
+        """Locate the SDK v4 Python Convenience API's examples/HEDS folder."""
+        candidates: list[Path] = []
+        if self.config.heds_examples_dir:
+            explicit = Path(self.config.heds_examples_dir).expanduser()
+            if not (explicit / "HEDS").is_dir():
+                raise RuntimeError(
+                    f"--heds-examples-dir must contain the HEDS folder: {explicit}"
+                )
+            candidates.append(explicit)
+        else:
+            environment_path = os.environ.get("HEDS_EXAMPLES_DIR")
+            if environment_path:
+                candidates.append(Path(environment_path).expanduser())
+
+            # The manual also permits copying HEDS beside the user script.
+            candidates.append(Path(__file__).resolve().parent)
+
+            program_files = os.environ.get("ProgramFiles")
+            if program_files:
+                installation_root = Path(program_files) / "HOLOEYE Photonics"
+                if installation_root.is_dir():
+                    candidates.extend(
+                        sorted(
+                            installation_root.glob(
+                                "SLM Display SDK (Python) v*/examples"
+                            ),
+                            reverse=True,
+                        )
+                    )
+
+        for candidate in candidates:
+            if (candidate / "HEDS").is_dir():
+                candidate_text = str(candidate.resolve())
+                if candidate_text not in sys.path:
+                    sys.path.insert(0, candidate_text)
+                return candidate
+        return None
 
     def open(self) -> None:
+        detected_examples_dir = self._prepare_heds_import_path()
+        heds_import_error: Optional[ImportError] = None
         try:
             import HEDS  # type: ignore
-        except ImportError:
+        except ImportError as exc:
+            heds_import_error = exc
             HEDS = None
         if HEDS is not None:
             self.module = HEDS
@@ -260,18 +314,22 @@ class HoloeyeSLM:
             )
             self._check_error(error, "SDK initialization")
             self.sdk_initialized = True
-            kwargs = {}
             if self.config.slm_preselect:
-                kwargs["preselect"] = self.config.slm_preselect
-            self.slm = HEDS.SLM.Init(**kwargs)
+                self.slm = HEDS.SLM.Init(self.config.slm_preselect)
+            else:
+                self.slm = HEDS.SLM.Init()
             self._check_error(self.slm.errorCode(), "SLM initialization")
+            if detected_examples_dir:
+                print(f"Loaded HEDS from {detected_examples_dir}")
         else:
             try:
                 from holoeye import slmdisplaysdk  # type: ignore
             except ImportError as exc:
+                detail = f" Original HEDS import error: {heds_import_error}." if heds_import_error else ""
                 raise RuntimeError(
-                    "HOLOEYE SDK Python module not found. Install the SLM Display SDK "
-                    "and add its api/python and examples directories to PYTHONPATH."
+                    "HOLOEYE SDK Python module not found. For SDK v4, copy the "
+                    "examples/HEDS folder beside this script or pass "
+                    f"--heds-examples-dir with the SDK examples directory.{detail}"
                 ) from exc
             self.module = slmdisplaysdk
             self.slm = slmdisplaysdk.SLMDisplay()
@@ -652,6 +710,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slm-height", type=positive_int, default=1080)
     parser.add_argument("--slm-preselect", default=None, help="Optional HEDS 4.x selection string")
     parser.add_argument(
+        "--heds-examples-dir",
+        default=None,
+        metavar="PATH",
+        help="SDK v4 examples directory containing the HEDS folder",
+    )
+    parser.add_argument(
         "--heds-api-version",
         type=sdk_version,
         default=(4, 2),
@@ -704,6 +768,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         pixel_format=args.pixel_format,
         camera_serial=args.camera_serial,
         slm_preselect=args.slm_preselect,
+        heds_examples_dir=args.heds_examples_dir,
         heds_api_major=args.heds_api_version[0],
         heds_api_minor=args.heds_api_version[1],
         magnification=args.magnification,

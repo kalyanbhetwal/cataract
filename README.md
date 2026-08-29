@@ -33,9 +33,13 @@ mode.
 ## 2. Install vendor software on the acquisition PC
 
 1. Install the HOLOEYE SLM Display SDK supplied through the HOLOEYE customer
-   site. Add its `api/python` and `examples` directories to `PYTHONPATH` if its
-   installer does not do so. The script defaults to HEDS API 4.2; pass
-   `--heds-api-version 4.1` or `4.0` if that is the installed SDK.
+   site. The included v4 manual says the Python Convenience API is the `HEDS`
+   folder inside the SDK's `examples` directory. Either copy that `HEDS` folder
+   beside `acquire_slm_camera.py`, or pass the parent directory using
+   `--heds-examples-dir`. The `HEDS/detect_heds_module_path.py` helper then uses
+   the installer-created environment variable to locate the lower-level
+   `api/python` binding. The script defaults to HEDS API 4.2, matching the
+   supplied v14 manual; pass `--heds-api-version 4.1` or `4.0` for an older SDK.
 2. Install a Spinnaker SDK version that supports the connected Grasshopper3,
    including its matching `PySpin` Python package.
 3. Install this script's normal Python dependencies:
@@ -47,7 +51,64 @@ python -m pip install -r requirements.txt
 HOLOEYE currently distributes its desktop Display SDK for Windows. Run
 hardware acquisition on the Windows computer driving the SLM, not on this Mac.
 
-## 3. Acquire data
+Before running Python, confirm the SDK manual's display requirements:
+
+- Use Windows 10 or 11 and configure the SLM as an extended desktop display.
+- Turn off Windows Night Light and other color-changing/display power-saving
+  features.
+- Run one of the SDK's supplied Python examples first. The vendor states that
+  these examples are release-tested and are the recommended project starting
+  point.
+- Note the exact SDK `examples` directory and the camera serial number.
+
+## 3. Supply the SDK path on Windows
+
+`--heds-examples-dir` must point to the SDK's `examples` directory. That
+directory must contain an `HEDS` subdirectory. Do not point the option directly
+to `examples\HEDS`, the SDK root, or `api\python`.
+
+For an SDK folder on the Windows Desktop:
+
+```powershell
+$HedsExamples = "$env:USERPROFILE\Desktop\SLM Display SDK (Python) v4.2.0\examples"
+Test-Path "$HedsExamples\HEDS"
+```
+
+For the standard Program Files installation:
+
+```powershell
+$HedsExamples = "C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.2.0\examples"
+Test-Path "$HedsExamples\HEDS"
+```
+
+`Test-Path` must return `True`. Supply the validated value to the script:
+
+```powershell
+python acquire_slm_camera.py `
+  --heds-examples-dir "$HedsExamples" `
+  --slm-preselect "index:0" `
+  --num-patterns 3 `
+  --camera-serial YOUR_CAMERA_SERIAL `
+  --output-dir data\test_run
+```
+
+To avoid supplying the option every time, save it as a user environment
+variable:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+  "HEDS_EXAMPLES_DIR",
+  $HedsExamples,
+  "User"
+)
+```
+
+Restart PowerShell after setting the variable. The script can then find HEDS
+without `--heds-examples-dir`. As another supported option, copy the complete
+`HEDS` directory from the SDK's `examples` folder beside
+`acquire_slm_camera.py`.
+
+## 4. Acquire data
 
 Close SpinView and any HOLOEYE example that has exclusive control of a device,
 then start with a short, low-risk run:
@@ -55,8 +116,10 @@ then start with a short, low-risk run:
 ```powershell
 python acquire_slm_camera.py `
   --num-patterns 3 `
+  --heds-examples-dir "$HedsExamples" `
+  --slm-preselect "index:0" `
   --camera-serial YOUR_CAMERA_SERIAL `
-  --output-dir data/test_run
+  --output-dir data\test_run
 ```
 
 Inspect the captured intensities and pattern changes. Then acquire the desired
@@ -116,6 +179,7 @@ Useful options:
 - `--output-format npy`: avoid the SciPy MAT-file dependency.
 - `--discard-frames N`: discard buffered frames after each SLM update.
 - `--slm-preselect STRING`: select an SLM in HEDS 4.x multi-SLM setups.
+- `--heds-examples-dir PATH`: locate the installed SDK's `examples/HEDS` API.
 - `--heds-api-version 4.1`: match an older installed HEDS SDK.
 
 The reference does not specify its Zernike sign/order convention, camera color
