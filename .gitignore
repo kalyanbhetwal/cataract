@@ -1,0 +1,25 @@
+# Reference documents
+*.pdf
+
+# Acquisition and generated experiment data
+data/
+output/
+tmp/
+*.npy
+SLM_raw*.mat
+SLM_sim*.mat
+manifest.json
+
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local/editor artifacts
+.DS_Store
+*.log
