@@ -3,7 +3,9 @@ import sys
 import tempfile
 import unittest
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -11,6 +13,9 @@ from acquire_slm_camera import (
     ExperimentConfig,
     HoloeyeSLM,
     NeuWSPatternGenerator,
+    PlayerOneCamera,
+    build_parser,
+    config_from_args,
     noll_indices,
     phase_to_u8,
     process_neuws_frame,
@@ -28,14 +33,17 @@ def test_config(seed=7):
         fringe_slope_rad_per_pixel=4.0 * math.pi / 3.0,
         slm_height=108,
         slm_width=192,
+        wavelength_nm=532.0,
         settle_ms=0.0,
         exposure_ms=100.0,
-        gain_db=0.0,
+        gain=0.0,
         gamma=1.0,
         camera_timeout_ms=3000,
         discard_frames=1,
-        pixel_format="Mono16",
+        pixel_format="auto",
+        camera_backend="playerone",
         camera_serial=None,
+        playerone_sdk_dir=None,
         slm_preselect=None,
         heds_examples_dir=None,
         heds_api_major=4,
@@ -99,6 +107,61 @@ class PatternTests(unittest.TestCase):
                 self.assertEqual(sys.path[0], str(examples_dir.resolve()))
             finally:
                 sys.path[:] = original_path
+
+    def test_explicit_playerone_sdk_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            sdk_dir = Path(directory)
+            (sdk_dir / "python").mkdir()
+            (sdk_dir / "lib" / "x64").mkdir(parents=True)
+            (sdk_dir / "python" / "pyPOACamera.py").touch()
+            (sdk_dir / "lib" / "x64" / "PlayerOneCamera.dll").touch()
+            config = replace(test_config(), playerone_sdk_dir=directory)
+            camera = PlayerOneCamera(config)
+            python_dir, dll_dir = camera._locate_sdk()
+            self.assertEqual(python_dir, (sdk_dir / "python").resolve())
+            self.assertEqual(dll_dir, (sdk_dir / "lib" / "x64").resolve())
+
+    def test_playerone_snap_capture_returns_two_dimensional_raw16(self):
+        class Errors(Enum):
+            POA_OK = 0
+
+        class States(Enum):
+            STATE_OPENED = 1
+
+        fake_module = SimpleNamespace(
+            POAErrors=Errors,
+            POACameraState=States,
+            StartExposure=lambda camera_id, single: Errors.POA_OK,
+            GetCameraState=lambda camera_id: (Errors.POA_OK, States.STATE_OPENED),
+            ImageReady=lambda camera_id: (Errors.POA_OK, True),
+            GetImage=lambda camera_id, timeout: (
+                Errors.POA_OK,
+                np.arange(12, dtype=np.uint16).reshape(3, 4, 1),
+            ),
+        )
+        camera = PlayerOneCamera(replace(test_config(), discard_frames=0))
+        camera.module = fake_module
+        camera.camera_id = 7
+        camera.properties = SimpleNamespace(cameraModelName=b"TestCam", SN=b"SN123")
+        frame, metadata = camera.capture()
+        self.assertEqual(frame.shape, (3, 4))
+        self.assertEqual(frame.dtype, np.uint16)
+        self.assertEqual(metadata["pixel_format"], "RAW16")
+        self.assertEqual(metadata["camera_serial"], "SN123")
+
+    def test_default_camera_backend_is_pyspin(self):
+        parser = build_parser()
+        config = config_from_args(parser.parse_args(["--dry-run"]))
+        self.assertEqual(config.camera_backend, "pyspin")
+        self.assertEqual(config.discard_frames, 1)
+        self.assertEqual(config.pixel_format, "auto")
+
+    def test_playerone_default_discards_no_snap_frames(self):
+        parser = build_parser()
+        config = config_from_args(
+            parser.parse_args(["--dry-run", "--camera-backend", "playerone"])
+        )
+        self.assertEqual(config.discard_frames, 0)
 
 
 if __name__ == "__main__":

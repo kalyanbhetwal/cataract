@@ -1,6 +1,10 @@
 # Reference documents
 *.pdf
 
+# Locally copied vendor SDK distributions/binaries
+/PlayerOne_Camera_SDK*/
+*.dll
+
 # Acquisition and generated experiment data
 data/
 output/
