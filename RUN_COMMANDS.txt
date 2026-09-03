@@ -1,0 +1,23 @@
+# Windows PowerShell commands. Run one command at a time from this project directory.
+# Replace the HEDS path, camera serial, and wavelength with the values for your setup.
+
+# Install Python dependencies.
+python -m pip install -r requirements.txt
+
+# Simulate both the 1920x1200 SLM and camera, recording exactly 3 simulated measurements.
+python acquire_slm_camera.py --dry-run --num-patterns 3 --slm-width 1920 --slm-height 1200 --output-format npy --save-full-patterns
+
+# Run the automated software tests without hardware.
+python -m unittest -v test_acquire_slm_camera.py
+
+# Capture one real camera frame without opening the SLM.
+python camera_smoke_test.py --camera-serial YOUR_CAMERA_SERIAL --exposure-ms 100 --gain-db 0 --pixel-format Mono16
+
+# Tell the current PowerShell session where the HOLOEYE SDK examples directory is located.
+$env:HEDS_EXAMPLES_DIR = "C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.2.1\examples"
+
+# Record exactly 3 real measurements: display 3 SLM patterns and save one camera frame per pattern.
+python acquire_slm_camera.py --num-patterns 3 --slm-width 1920 --slm-height 1200 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-dir data\hardware_test_001
+
+# Example full run recording exactly 100 real measurements; use a new output directory each time.
+python acquire_slm_camera.py --num-patterns 100 --slm-width 1920 --slm-height 1200 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-dir data\measurement_001

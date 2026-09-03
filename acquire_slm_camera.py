@@ -175,6 +175,28 @@ def process_neuws_frame(frame: np.ndarray, magnification: float, crop_size: int)
     ].copy()
 
 
+def make_preview_u8(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
+    """Scale the 1st-99th percentile range into a viewable 8-bit preview."""
+    preview_source = frame[:, :, 0] if frame.ndim == 3 and frame.shape[2] == 1 else frame
+    if preview_source.ndim not in (2, 3):
+        raise ValueError(f"Cannot create a PNG preview from shape {frame.shape}")
+    if preview_source.ndim == 3 and preview_source.shape[2] not in (3, 4):
+        raise ValueError(f"Cannot create a PNG preview from shape {frame.shape}")
+
+    values = np.asarray(preview_source, dtype=np.float64)
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size == 0:
+        raise ValueError("Cannot create a PNG preview from an image without finite values")
+    low, high = (float(value) for value in np.percentile(finite_values, (1.0, 99.0)))
+    if high <= low:
+        preview = np.zeros(preview_source.shape, dtype=np.uint8)
+    else:
+        preview = np.clip((values - low) * (255.0 / (high - low)), 0, 255).astype(
+            np.uint8
+        )
+    return preview, low, high
+
+
 class NeuWSPatternGenerator:
     """Generate deterministic paper-style random Zernike phase patterns."""
 
@@ -841,12 +863,21 @@ class OutputWriter:
             self._savemat = savemat
         else:
             self._savemat = None
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "PNG preview output requires Pillow. Install dependencies with "
+                "python -m pip install -r requirements.txt"
+            ) from exc
+        self._image_class = Image
 
         self.raw_dir = output_dir / "raw"
+        self.preview_dir = output_dir / "previews"
         self.processed_dir = output_dir / "processed"
         self.pattern_dir = output_dir / "patterns"
         self.neuws_dir = output_dir / "neuws_mat"
-        for directory in (self.raw_dir, self.pattern_dir):
+        for directory in (self.raw_dir, self.preview_dir, self.pattern_dir):
             directory.mkdir(parents=True, exist_ok=True)
         if config.neuws_processing:
             self.processed_dir.mkdir(parents=True, exist_ok=True)
@@ -868,8 +899,11 @@ class OutputWriter:
     ) -> None:
         number = index + 1
         raw_path = self.raw_dir / f"frame_{number:04d}.npy"
+        preview_path = self.preview_dir / f"frame_{number:04d}.png"
         modulation_path = self.pattern_dir / f"phase_modulation_{number:04d}.npy"
         np.save(raw_path, frame, allow_pickle=False)
+        preview, preview_low, preview_high = make_preview_u8(frame)
+        self._image_class.fromarray(preview).save(preview_path)
         np.save(modulation_path, modulation, allow_pickle=False)
 
         full_pattern_path: Optional[Path] = None
@@ -904,6 +938,9 @@ class OutputWriter:
         record = {
             "pattern_index": number,
             "raw_path": str(raw_path.relative_to(self.output_dir)),
+            "preview_path": str(preview_path.relative_to(self.output_dir)),
+            "preview_scale_1st_percentile": preview_low,
+            "preview_scale_99th_percentile": preview_high,
             "processed_path": (
                 str(processed_path.relative_to(self.output_dir)) if processed_path else None
             ),

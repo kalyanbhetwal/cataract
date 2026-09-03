@@ -218,15 +218,18 @@ Each run contains:
 sample_001/
   manifest.json
   raw/frame_0001.npy
+  previews/frame_0001.png
   processed/frame_0001.npy
   patterns/phase_modulation_0001.npy
   neuws_mat/SLM_raw1.mat
   neuws_mat/SLM_sim1.mat
 ```
 
-The full sensor frame is always retained in `raw/`. `processed/` contains the
-3.57x downscaled, centered 256 x 256 image. The MAT files use the variable and
-filename conventions expected by the public NeuWS reconstruction code:
+The full sensor frame is always retained unchanged in `raw/`. `previews/`
+contains viewable 8-bit PNGs scaled between each frame's 1st and 99th
+percentiles; these previews are for inspection rather than quantitative use.
+`processed/` contains the 3.57x downscaled, centered 256 x 256 image. The MAT
+files use the variable and filename conventions expected by the public NeuWS reconstruction code:
 `imsdata` in `SLM_rawN.mat` and `proj_sim` in `SLM_simN.mat`.
 
 `manifest.json` records all settings, Zernike coefficients, file paths, camera

@@ -12,7 +12,7 @@ from typing import Optional
 
 import numpy as np
 
-from acquire_slm_camera import PySpinCamera
+from acquire_slm_camera import PySpinCamera, make_preview_u8
 
 
 @dataclass(frozen=True)
@@ -30,28 +30,6 @@ class CameraConfig:
 def default_output_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return Path("data") / f"camera_test_{stamp}.npy"
-
-
-def make_preview_u8(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """Scale the 1st-99th percentile range into a viewable 8-bit preview."""
-    preview_source = frame[:, :, 0] if frame.ndim == 3 and frame.shape[2] == 1 else frame
-    if preview_source.ndim not in (2, 3):
-        raise ValueError(f"Cannot create a PNG preview from shape {frame.shape}")
-    if preview_source.ndim == 3 and preview_source.shape[2] not in (3, 4):
-        raise ValueError(f"Cannot create a PNG preview from shape {frame.shape}")
-
-    values = np.asarray(preview_source, dtype=np.float64)
-    finite_values = values[np.isfinite(values)]
-    if finite_values.size == 0:
-        raise ValueError("Cannot create a PNG preview from an image without finite values")
-    low, high = (float(value) for value in np.percentile(finite_values, (1.0, 99.0)))
-    if high <= low:
-        preview = np.zeros(preview_source.shape, dtype=np.uint8)
-    else:
-        preview = np.clip((values - low) * (255.0 / (high - low)), 0, 255).astype(
-            np.uint8
-        )
-    return preview, low, high
 
 
 def build_parser() -> argparse.ArgumentParser:
