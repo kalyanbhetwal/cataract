@@ -33,6 +33,7 @@ def test_config(seed=7):
         zernike_modes=15,
         coefficient_std_rad=5.0,
         fringe_slope_rad_per_pixel=4.0 * math.pi / 3.0,
+        fringe_orientation="vertical",
         slm_height=108,
         slm_width=192,
         wavelength_nm=532.0,
@@ -80,6 +81,28 @@ class PatternTests(unittest.TestCase):
         self.assertEqual(first[1].shape, (144, 256))
         self.assertGreaterEqual(float(first[0].min()), 0.0)
         self.assertLess(float(first[0].max()), 2.0 * math.pi)
+
+    def test_vertical_fringe_lines_vary_along_x(self):
+        generator = NeuWSPatternGenerator(
+            replace(
+                test_config(),
+                fringe_orientation="vertical",
+                fringe_slope_rad_per_pixel=math.pi / 2.0,
+            )
+        )
+        np.testing.assert_array_equal(generator._fringe[0], generator._fringe[-1])
+        self.assertNotEqual(generator._fringe[0, 0], generator._fringe[0, 1])
+
+    def test_horizontal_fringe_lines_vary_along_y(self):
+        generator = NeuWSPatternGenerator(
+            replace(
+                test_config(),
+                fringe_orientation="horizontal",
+                fringe_slope_rad_per_pixel=math.pi / 2.0,
+            )
+        )
+        np.testing.assert_array_equal(generator._fringe[:, 0], generator._fringe[:, -1])
+        self.assertNotEqual(generator._fringe[0, 0], generator._fringe[1, 0])
 
     def test_quantization_uses_full_byte_period(self):
         phases = np.array([0.0, math.pi, 2.0 * math.pi - 1e-7])
@@ -155,6 +178,7 @@ class PatternTests(unittest.TestCase):
         parser = build_parser()
         config = config_from_args(parser.parse_args(["--dry-run"]))
         self.assertEqual(config.camera_backend, "pyspin")
+        self.assertEqual(config.fringe_orientation, "vertical")
         self.assertEqual(config.discard_frames, 1)
         self.assertEqual(config.pixel_format, "auto")
 

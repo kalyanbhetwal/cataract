@@ -4,7 +4,8 @@
 `sciadv.adg4671_sm.pdf`:
 
 - HOLOEYE LETO-3 phase resolution: 1080 x 1920.
-- Linear x fringe with slope `4*pi/3` radians per pixel.
+- Vertical fringe lines with slope `4*pi/3` radians per pixel; phase varies
+  left-to-right along the SLM x-axis.
 - Random sums of the first 15 RMS-normalized Zernike modes, with independent
   Gaussian coefficients having a standard deviation of 5 radians.
 - A 256 x 256 modulation cropped to 144 x 256, nearest-neighbor upsampled to
@@ -248,6 +249,8 @@ Useful options:
 - `--playerone-sdk-dir PATH`: locate the Player One SDK root or `python` folder.
 - `--camera-backend playerone`: switch from the default PySpin camera.
 - `--wavelength-nm 532`: select the wavelength used by HOLOEYE's phase lookup.
+- `--fringe-orientation vertical`: use vertical fringe lines (the default),
+  with phase varying along x. Use `horizontal` to vary phase along y instead.
 
 The reference does not specify its Zernike sign/order convention, camera color
 model, or the coordinate units attached to the stated fringe slope. This

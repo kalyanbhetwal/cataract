@@ -34,6 +34,7 @@ class ExperimentConfig:
     zernike_modes: int
     coefficient_std_rad: float
     fringe_slope_rad_per_pixel: float
+    fringe_orientation: str
     slm_height: int
     slm_width: int
     wavelength_nm: float
@@ -205,11 +206,28 @@ class NeuWSPatternGenerator:
         self._rng = np.random.default_rng(config.seed)
         self._basis = zernike_basis(256, config.zernike_modes)
         self._crop_start = (256 - 144) // 2
-        x = np.arange(config.slm_width, dtype=np.float64)
-        fringe_row = np.mod(config.fringe_slope_rad_per_pixel * x, TWO_PI)
-        self._fringe = np.broadcast_to(
-            fringe_row, (config.slm_height, config.slm_width)
-        )
+        if config.fringe_orientation == "vertical":
+            # Vertical fringe lines: phase changes left-to-right (along x).
+            coordinate = np.arange(config.slm_width, dtype=np.float64)
+            fringe_line = np.mod(
+                config.fringe_slope_rad_per_pixel * coordinate, TWO_PI
+            )
+            self._fringe = np.broadcast_to(
+                fringe_line, (config.slm_height, config.slm_width)
+            )
+        elif config.fringe_orientation == "horizontal":
+            # Horizontal fringe lines: phase changes top-to-bottom (along y).
+            coordinate = np.arange(config.slm_height, dtype=np.float64)
+            fringe_line = np.mod(
+                config.fringe_slope_rad_per_pixel * coordinate, TWO_PI
+            )
+            self._fringe = np.broadcast_to(
+                fringe_line[:, None], (config.slm_height, config.slm_width)
+            )
+        else:
+            raise ValueError(
+                f"Unsupported fringe orientation: {config.fringe_orientation!r}"
+            )
 
     def next(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         coefficients = self._rng.normal(
@@ -1025,6 +1043,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=4.0 * math.pi / 3.0,
         help="Paper value: 4*pi/3",
     )
+    parser.add_argument(
+        "--fringe-orientation",
+        choices=("vertical", "horizontal"),
+        default="vertical",
+        help=(
+            "Fringe-line orientation: vertical varies phase along x; horizontal "
+            "varies phase along y (default: vertical)"
+        ),
+    )
     parser.add_argument("--slm-width", type=positive_int, default=1920)
     parser.add_argument("--slm-height", type=positive_int, default=1080)
     parser.add_argument(
@@ -1128,6 +1155,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         zernike_modes=args.zernike_modes,
         coefficient_std_rad=args.coefficient_std_rad,
         fringe_slope_rad_per_pixel=args.fringe_slope_rad_per_pixel,
+        fringe_orientation=args.fringe_orientation,
         slm_height=args.slm_height,
         slm_width=args.slm_width,
         wavelength_nm=args.wavelength_nm,
