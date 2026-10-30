@@ -14,9 +14,10 @@ import importlib
 import json
 import math
 import os
+import subprocess
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -62,6 +63,7 @@ class ExperimentConfig:
     require_16_bit: bool
     dry_run: bool
     capture_fringe_first: bool = False
+    confirm_fringe_preview: bool = False
 
 
 def noll_indices(count: int) -> list[tuple[int, int]]:
@@ -223,6 +225,76 @@ def make_preview_u8(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
             np.uint8
         )
     return preview, low, high
+
+
+def open_fringe_preview(preview_path: Path) -> None:
+    """Open the saved full-frame preview with the system's image viewer."""
+    preview_path = preview_path.resolve()
+    print(f"\nFringe-only camera preview: {preview_path}")
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(preview_path))
+        else:
+            launcher = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([launcher, str(preview_path)])
+    except OSError as exc:
+        print(
+            f"Could not open the image viewer: {exc}\n"
+            "Open the preview path above manually before answering.",
+            file=sys.stderr,
+        )
+
+
+def confirm_fringe_preview(
+    preview_path: Path, config: ExperimentConfig,
+) -> bool | ExperimentConfig | None:
+    """Approve, stop, or request another capture with adjusted steering."""
+    open_fringe_preview(preview_path)
+    print("The steering fringe stays displayed while you inspect the captured image.")
+    sampled_slope = math.remainder(config.fringe_slope_rad_per_pixel, TWO_PI)
+    period_label = (
+        f"{TWO_PI / sampled_slope:+.6g} pixels"
+        if abs(sampled_slope) > 1e-12
+        else "flat phase (no steering ramp)"
+    )
+    print(f"Current fringe: {config.fringe_orientation} lines; sampled period {period_label}")
+    print(
+        "P <pixels>: set signed fringe period (absolute value >= 2); "
+        "R: reverse direction; H/V: horizontal/vertical fringe lines; C: recapture."
+    )
+    while True:
+        try:
+            response = input(
+                "Are zero and first orders separated? Proceed with random phase patterns? "
+                "[Y/N, P pixels, R, H, V, C]: "
+            ).strip().upper()
+        except (EOFError, OSError):
+            print("No terminal response available; random phase patterns will not be applied.")
+            return None
+        if response in ("Y", "YES"):
+            return True
+        if response in ("N", "NO"):
+            return False
+        if response == "C":
+            return config
+        if response == "R":
+            return replace(config, fringe_slope_rad_per_pixel=-config.fringe_slope_rad_per_pixel)
+        if response in ("H", "V"):
+            return replace(
+                config,
+                fringe_orientation="horizontal" if response == "H" else "vertical",
+            )
+        parts = response.split()
+        if parts and parts[0] == "P":
+            try:
+                if len(parts) != 2:
+                    raise argparse.ArgumentTypeError("Use P followed by a period, e.g. P 20")
+                period = fringe_period_pixels(parts[1])
+            except argparse.ArgumentTypeError as exc:
+                print(exc)
+                continue
+            return replace(config, fringe_slope_rad_per_pixel=TWO_PI / period)
+        print("Enter Y to proceed, N to stop, or a steering command: P pixels, R, H, V, C.")
 
 
 class NeuWSPatternGenerator:
@@ -938,6 +1010,7 @@ class OutputWriter:
         self.config = config
         self.records: list[dict[str, Any]] = []
         self.fringe_reference: Optional[dict[str, Any]] = None
+        self.fringe_references: list[dict[str, Any]] = []
 
     def save_fringe_reference(
         self,
@@ -946,19 +1019,24 @@ class OutputWriter:
         camera_metadata: dict[str, Any],
         display_time_ns: int,
         capture_time_ns: int,
-    ) -> None:
-        """Save an uncropped fringe-only reference separately from random frames."""
+    ) -> Path:
+        """Keep every steering preview and point to the most recent reference."""
         reference_dir = self.output_dir / "reference"
         reference_dir.mkdir(parents=True, exist_ok=True)
-        raw_path = reference_dir / "fringe_only.npy"
-        preview_path = reference_dir / "fringe_only.png"
-        phase_path = reference_dir / "phase_slm.npy"
+        reference_number = len(self.fringe_references) + 1
+        suffix = "" if reference_number == 1 else f"_{reference_number:04d}"
+        raw_path = reference_dir / f"fringe_only{suffix}.npy"
+        preview_path = reference_dir / f"fringe_only{suffix}.png"
+        phase_path = reference_dir / f"phase_slm{suffix}.npy"
         np.save(raw_path, frame, allow_pickle=False)
         preview, preview_low, preview_high = make_preview_u8(frame)
         self._image_class.fromarray(preview).save(preview_path)
         np.save(phase_path, displayed_phase, allow_pickle=False)
         self.fringe_reference = {
             "pattern_type": "fringe_only",
+            "reference_index": reference_number,
+            "fringe_slope_rad_per_pixel": self.config.fringe_slope_rad_per_pixel,
+            "fringe_orientation": self.config.fringe_orientation,
             "raw_path": str(raw_path.relative_to(self.output_dir)),
             "preview_path": str(preview_path.relative_to(self.output_dir)),
             "preview_scale_1st_percentile": preview_low,
@@ -968,8 +1046,32 @@ class OutputWriter:
             "capture_time_ns": capture_time_ns,
             "frame_dtype": str(frame.dtype),
             "frame_shape": list(frame.shape),
+            "preview_feedback": (
+                {"status": "pending"} if self.config.confirm_fringe_preview else None
+            ),
             **camera_metadata,
         }
+        self.fringe_references.append(self.fringe_reference)
+        self._write_manifest()
+        return preview_path
+
+    def save_fringe_feedback(
+        self, approved: Optional[bool], next_config: Optional[ExperimentConfig] = None,
+    ) -> None:
+        """Persist operator feedback before any random phase is displayed."""
+        if self.fringe_reference is None:
+            raise RuntimeError("Cannot record preview feedback without a fringe reference")
+        status = "no_input" if approved is None else ("approved" if approved else "declined")
+        self.fringe_reference["preview_feedback"] = {
+            "status": status,
+            "response_time_ns": time.time_ns(),
+        }
+        if next_config is not None:
+            self.fringe_reference["preview_feedback"].update({
+                "status": "recaptured" if next_config == self.config else "adjusted",
+                "requested_fringe_slope_rad_per_pixel": next_config.fringe_slope_rad_per_pixel,
+                "requested_fringe_orientation": next_config.fringe_orientation,
+            })
         self._write_manifest()
 
     def save(
@@ -1068,6 +1170,7 @@ class OutputWriter:
             "configuration": asdict(self.config),
             "frames_completed": len(self.records),
             "fringe_reference": self.fringe_reference,
+            "fringe_references": self.fringe_references,
             "frames": self.records,
         }
         temporary_path = self.output_dir / "manifest.json.tmp"
@@ -1102,6 +1205,19 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def fringe_period_pixels(value: str) -> float:
+    """Validate a signed spatial period resolvable on the SLM pixel grid."""
+    try:
+        period = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Fringe period must be a number in pixels") from exc
+    if not math.isfinite(period) or abs(period) < 2:
+        raise argparse.ArgumentTypeError(
+            "Fringe period must be finite with an absolute value of at least 2 pixels"
+        )
+    return period
+
+
 def sdk_version(value: str) -> tuple[int, int]:
     try:
         major_text, minor_text = value.split(".", maxsplit=1)
@@ -1131,13 +1247,29 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Capture a full-frame pure fringe reference before adding random phase patterns",
     )
+    parser.add_argument(
+        "--confirm-fringe-preview",
+        action="store_true",
+        help=(
+            "Open fringe previews to adjust steering, then require Y/N feedback before "
+            "random phase patterns; also enables --capture-fringe-first"
+        ),
+    )
     parser.add_argument("--zernike-modes", type=positive_int, default=15)
     parser.add_argument("--coefficient-std-rad", type=float, default=5.0)
-    parser.add_argument(
+    fringe_spacing = parser.add_mutually_exclusive_group()
+    fringe_spacing.add_argument(
         "--fringe-slope-rad-per-pixel",
         type=float,
         default=4.0 * math.pi / 3.0,
         help="Paper value: 4*pi/3",
+    )
+    fringe_spacing.add_argument(
+        "--fringe-period-pixels",
+        type=fringe_period_pixels,
+        default=None,
+        metavar="PIXELS",
+        help="Signed fringe period (absolute value >= 2); sets slope to 2*pi/period",
     )
     parser.add_argument(
         "--fringe-orientation",
@@ -1254,6 +1386,13 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
             "Settle time and coefficient std must be nonnegative; exposure and "
             "wavelength must be positive"
         )
+    fringe_slope = (
+        TWO_PI / args.fringe_period_pixels
+        if args.fringe_period_pixels is not None
+        else args.fringe_slope_rad_per_pixel
+    )
+    if not math.isfinite(fringe_slope):
+        raise ValueError("Fringe slope must be finite")
     discard_frames = (
         args.discard_frames
         if args.discard_frames is not None
@@ -1264,7 +1403,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         seed=args.seed,
         zernike_modes=args.zernike_modes,
         coefficient_std_rad=args.coefficient_std_rad,
-        fringe_slope_rad_per_pixel=args.fringe_slope_rad_per_pixel,
+        fringe_slope_rad_per_pixel=fringe_slope,
         fringe_orientation=args.fringe_orientation,
         slm_height=args.slm_height,
         slm_width=args.slm_width,
@@ -1292,11 +1431,13 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         save_full_patterns=args.save_full_patterns,
         require_16_bit=not args.allow_non_16_bit,
         dry_run=args.dry_run,
-        capture_fringe_first=args.capture_fringe_first,
+        capture_fringe_first=args.capture_fringe_first or args.confirm_fringe_preview,
+        confirm_fringe_preview=args.confirm_fringe_preview,
     )
 
 
-def run(config: ExperimentConfig, output_dir: Path) -> None:
+def run(config: ExperimentConfig, output_dir: Path) -> bool:
+    """Acquire a sequence; return False if fringe review stops the run early."""
     writer = OutputWriter(output_dir, config)
     generator = NeuWSPatternGenerator(config)
     slm = SimulatedSLM(config) if config.dry_run else HoloeyeSLM(config)
@@ -1319,19 +1460,36 @@ def run(config: ExperimentConfig, output_dir: Path) -> None:
     try:
         slm.open()
         camera.open()
-        if config.capture_fringe_first:
-            fringe_phase = generator.fringe_only()
-            frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
-                fringe_phase
-            )
-            writer.save_fringe_reference(
-                frame,
-                fringe_phase,
-                camera_metadata,
-                display_time_ns,
-                capture_time_ns,
-            )
-            print(f"[reference] saved fringe-only {frame.shape} {frame.dtype} frame")
+        if config.capture_fringe_first or config.confirm_fringe_preview:
+            while True:
+                fringe_phase = generator.fringe_only()
+                frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
+                    fringe_phase
+                )
+                preview_path = writer.save_fringe_reference(
+                    frame,
+                    fringe_phase,
+                    camera_metadata,
+                    display_time_ns,
+                    capture_time_ns,
+                )
+                print(f"[reference] saved fringe-only {frame.shape} {frame.dtype} frame")
+                if not config.confirm_fringe_preview:
+                    break
+                approved = confirm_fringe_preview(preview_path, config)
+                if isinstance(approved, ExperimentConfig):
+                    writer.save_fringe_feedback(None, next_config=approved)
+                    config = approved
+                    writer.config = config
+                    # No random patterns have been generated yet, so the seeded
+                    # sequence starts identically after any number of adjustments.
+                    generator = NeuWSPatternGenerator(config)
+                    continue
+                writer.save_fringe_feedback(approved)
+                if approved is not True:
+                    print("Stopped before random phase patterns; the fringe reference is saved.")
+                    return False
+                break
         for index in range(config.num_patterns):
             displayed_phase, modulation, coefficients = generator.next()
             frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
@@ -1359,6 +1517,7 @@ def run(config: ExperimentConfig, output_dir: Path) -> None:
             camera.close()
         finally:
             slm.close()
+    return True
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1367,10 +1526,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         config = config_from_args(args)
         output_dir = args.output_dir or default_output_dir()
-        run(config, output_dir)
+        completed = run(config, output_dir)
     except (FileExistsError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"error: {exc}\n")
-    print(f"Acquisition complete: {output_dir.resolve()}")
+    if completed:
+        print(f"Acquisition complete: {output_dir.resolve()}")
+    else:
+        print(f"Acquisition stopped before random phase capture: {output_dir.resolve()}")
     return 0
 
 

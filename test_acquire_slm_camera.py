@@ -1,3 +1,4 @@
+import io
 import json
 import math
 import sys
@@ -20,7 +21,9 @@ from acquire_slm_camera import (
     PlayerOneCamera,
     build_parser,
     config_from_args,
+    main,
     noll_indices,
+    open_fringe_preview,
     phase_to_u8,
     process_neuws_frame,
     resize_nearest,
@@ -198,6 +201,7 @@ class PatternTests(unittest.TestCase):
         self.assertEqual(config.camera_backend, "pyspin")
         self.assertEqual(config.fringe_orientation, "vertical")
         self.assertFalse(config.capture_fringe_first)
+        self.assertFalse(config.confirm_fringe_preview)
         self.assertIsNone(config.crop_center_x)
         self.assertIsNone(config.crop_center_y)
         self.assertEqual(config.discard_frames, 1)
@@ -209,6 +213,28 @@ class PatternTests(unittest.TestCase):
             parser.parse_args(["--dry-run", "--camera-backend", "playerone"])
         )
         self.assertEqual(config.discard_frames, 0)
+
+    def test_signed_fringe_period_option_sets_ramp_slope(self):
+        parser = build_parser()
+        for period in (20, -20, 2):
+            with self.subTest(period=period):
+                config = config_from_args(
+                    parser.parse_args(["--fringe-period-pixels", str(period)])
+                )
+                self.assertAlmostEqual(config.fringe_slope_rad_per_pixel, 2 * math.pi / period)
+
+    def test_fringe_spacing_rejects_invalid_or_conflicting_values(self):
+        parser = build_parser()
+        for period in ("0", "1", "-1", "nan", "inf", "not-a-number"):
+            with self.subTest(period=period), patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args([f"--fringe-period-pixels={period}"])
+        with patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            parser.parse_args(
+                ["--fringe-period-pixels", "20", "--fringe-slope-rad-per-pixel", "1"]
+            )
+        with self.assertRaisesRegex(ValueError, "Fringe slope must be finite"):
+            config_from_args(parser.parse_args(["--fringe-slope-rad-per-pixel", "nan"]))
 
     def test_camera_png_preview_scaling(self):
         frame = np.arange(100, dtype=np.uint16).reshape(10, 10)
@@ -222,6 +248,12 @@ class PatternTests(unittest.TestCase):
 
 
 class AcquisitionSequenceTests(unittest.TestCase):
+    def test_preview_confirmation_enables_fringe_reference(self):
+        parser = build_parser()
+        config = config_from_args(parser.parse_args(["--confirm-fringe-preview"]))
+        self.assertTrue(config.capture_fringe_first)
+        self.assertTrue(config.confirm_fringe_preview)
+
     def test_fringe_reference_then_random_phase_preserves_full_camera_frames(self):
         parser = build_parser()
         config = config_from_args(
@@ -323,6 +355,208 @@ class AcquisitionSequenceTests(unittest.TestCase):
             )
             camera.close.assert_called_once()
             slm.close.assert_called_once()
+
+    def test_preview_feedback_gates_random_phase_and_keeps_fringe_displayed(self):
+        cases = [
+            ("approve_after_invalid_answers", ["", "maybe", " y "], True, "approved"),
+            ("decline", ["n"], False, "declined"),
+            ("end_of_input", [EOFError()], False, "no_input"),
+            ("unavailable_input", [OSError("no terminal")], False, "no_input"),
+        ]
+        for label, answers, expected_complete, expected_status in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as directory:
+                # Review alone must request a reference, even for direct Python callers.
+                config = replace(
+                    test_config(), num_patterns=1, confirm_fringe_preview=True,
+                    neuws_processing=False,
+                )
+                output_dir = Path(directory) / "run"
+                slm, camera = Mock(), Mock()
+                camera.capture.side_effect = [
+                    (np.zeros((12, 16), dtype=np.uint16), {"frame_id": number})
+                    for number in (1, 2)
+                ]
+                answer_iterator = iter(answers)
+
+                def feedback(_prompt):
+                    # No random phase may be shown or captured before an explicit Y.
+                    self.assertEqual(slm.show.call_count, 1)
+                    self.assertEqual(camera.capture.call_count, 1)
+                    slm.close.assert_not_called()
+                    camera.close.assert_not_called()
+                    manifest = json.loads((output_dir / "manifest.json").read_text())
+                    self.assertEqual(manifest["frames_completed"], 0)
+                    self.assertEqual(
+                        manifest["fringe_reference"]["preview_feedback"]["status"],
+                        "pending",
+                    )
+                    self.assertTrue(
+                        (output_dir / manifest["fringe_reference"]["preview_path"]).is_file()
+                    )
+                    response = next(answer_iterator)
+                    if isinstance(response, Exception):
+                        raise response
+                    return response
+
+                with (
+                    patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                    patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                    patch("acquire_slm_camera.open_fringe_preview") as open_preview,
+                    patch("builtins.input", side_effect=feedback) as prompt,
+                ):
+                    completed = run(config, output_dir)
+
+                self.assertEqual(completed, expected_complete)
+                self.assertEqual(prompt.call_count, len(answers))
+                open_preview.assert_called_once_with(output_dir / "reference" / "fringe_only.png")
+                manifest = json.loads((output_dir / "manifest.json").read_text())
+                self.assertEqual(
+                    manifest["fringe_reference"]["preview_feedback"]["status"], expected_status
+                )
+                self.assertEqual(manifest["frames_completed"], int(expected_complete))
+                self.assertEqual(slm.show.call_count, 1 + int(expected_complete))
+                self.assertEqual(camera.capture.call_count, 1 + int(expected_complete))
+                camera.close.assert_called_once()
+                slm.close.assert_called_once()
+
+    def test_cancelled_run_is_reported_as_stopped(self):
+        with (
+            patch("acquire_slm_camera.run", return_value=False),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            result = main(["--dry-run", "--confirm-fringe-preview"])
+        self.assertEqual(result, 0)
+        self.assertIn("Acquisition stopped before random phase capture:", output.getvalue())
+        self.assertNotIn("Acquisition complete:", output.getvalue())
+
+    def test_steering_adjustments_preserve_previews_and_use_accepted_fringe(self):
+        config = replace(
+            test_config(), capture_fringe_first=True, confirm_fringe_preview=True,
+            neuws_processing=False, save_full_patterns=True,
+            fringe_orientation="horizontal", settle_ms=300,
+        )
+        period_config = replace(config, fringe_slope_rad_per_pixel=2 * math.pi / 20)
+        reversed_config = replace(period_config, fringe_slope_rad_per_pixel=-2 * math.pi / 20)
+        vertical_config = replace(reversed_config, fringe_orientation="vertical")
+        accepted_config = replace(vertical_config, fringe_orientation="horizontal")
+        expected_configs = [
+            config, period_config, reversed_config, vertical_config, accepted_config,
+            accepted_config,
+        ]
+        answers = ["P", "P 0", "P 1", "P nan", "P twenty", "P 20", "R", "V", "H", "C", "Y"]
+        expected_counts = [1] * 6 + [2, 3, 4, 5, 6]
+        feedback_iterator = iter(zip(expected_counts, answers))
+        total_captures = len(expected_configs) + config.num_patterns
+        slm, camera = Mock(), Mock()
+        camera.capture.side_effect = [
+            (np.full((12, 16), number, dtype=np.uint16), {"frame_id": number})
+            for number in range(1, total_captures + 1)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+
+            def feedback(_prompt):
+                reference_count, answer = next(feedback_iterator)
+                self.assertEqual(slm.show.call_count, reference_count)
+                self.assertEqual(camera.capture.call_count, reference_count)
+                slm.close.assert_not_called()
+                camera.close.assert_not_called()
+                manifest = json.loads((output_dir / "manifest.json").read_text())
+                self.assertEqual(manifest["frames_completed"], 0)
+                self.assertEqual(len(manifest["fringe_references"]), reference_count)
+                self.assertEqual(
+                    manifest["fringe_reference"]["preview_feedback"]["status"], "pending"
+                )
+                return answer
+
+            with (
+                patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                patch("acquire_slm_camera.time.sleep") as settle,
+                patch("acquire_slm_camera.open_fringe_preview") as open_preview,
+                patch("builtins.input", side_effect=feedback) as prompt,
+            ):
+                self.assertTrue(run(config, output_dir))
+
+            self.assertEqual(prompt.call_count, len(answers))
+            self.assertEqual(open_preview.call_count, len(expected_configs))
+            self.assertEqual(
+                [call.args[0] for call in settle.call_args_list], [0.3] * total_captures
+            )
+            manifest = json.loads((output_dir / "manifest.json").read_text())
+            references = manifest["fringe_references"]
+            self.assertEqual(len(references), len(expected_configs))
+            self.assertEqual(manifest["fringe_reference"], references[-1])
+            self.assertEqual(
+                [r["preview_feedback"]["status"] for r in references],
+                ["adjusted"] * 4 + ["recaptured", "approved"],
+            )
+            self.assertEqual(len({r["raw_path"] for r in references}), len(expected_configs))
+            for index, (reference, reference_config) in enumerate(zip(references, expected_configs)):
+                expected_phase = NeuWSPatternGenerator(reference_config).fringe_only()
+                np.testing.assert_array_equal(slm.show.call_args_list[index].args[0], expected_phase)
+                np.testing.assert_array_equal(
+                    np.load(output_dir / reference["full_pattern_path"]), expected_phase
+                )
+                np.testing.assert_array_equal(
+                    np.load(output_dir / reference["raw_path"]),
+                    np.full((12, 16), index + 1, dtype=np.uint16),
+                )
+                self.assertTrue((output_dir / reference["preview_path"]).is_file())
+                self.assertEqual(reference["fringe_orientation"], reference_config.fringe_orientation)
+                self.assertAlmostEqual(
+                    reference["fringe_slope_rad_per_pixel"], reference_config.fringe_slope_rad_per_pixel
+                )
+            self.assertEqual(manifest["frames_completed"], config.num_patterns)
+            self.assertAlmostEqual(
+                manifest["configuration"]["fringe_slope_rad_per_pixel"],
+                accepted_config.fringe_slope_rad_per_pixel,
+            )
+            self.assertEqual(manifest["configuration"]["fringe_orientation"], "horizontal")
+            expected_generator = NeuWSPatternGenerator(accepted_config)
+            for index, record in enumerate(manifest["frames"]):
+                expected_phase, _, coefficients = expected_generator.next()
+                np.testing.assert_array_equal(
+                    slm.show.call_args_list[len(expected_configs) + index].args[0], expected_phase
+                )
+                np.testing.assert_array_equal(record["zernike_coefficients_rad"], coefficients)
+            camera.close.assert_called_once()
+            slm.close.assert_called_once()
+
+    def test_decline_or_missing_input_after_adjustment_stops_before_random_phase(self):
+        for response, status in (("N", "declined"), (EOFError(), "no_input")):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as directory:
+                config = replace(test_config(), confirm_fringe_preview=True, neuws_processing=False)
+                slm, camera = Mock(), Mock()
+                camera.capture.return_value = (np.zeros((12, 16), dtype=np.uint16), {"frame_id": 1})
+                output_dir = Path(directory) / "run"
+                with (
+                    patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                    patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                    patch("acquire_slm_camera.open_fringe_preview"),
+                    patch("builtins.input", side_effect=["P -16", response]),
+                ):
+                    self.assertFalse(run(config, output_dir))
+                manifest = json.loads((output_dir / "manifest.json").read_text())
+                self.assertEqual(manifest["frames_completed"], 0)
+                self.assertEqual(len(manifest["fringe_references"]), 2)
+                self.assertEqual(manifest["fringe_reference"]["preview_feedback"]["status"], status)
+                self.assertEqual(slm.show.call_count, 2)
+                self.assertEqual(camera.capture.call_count, 2)
+                self.assertFalse(any((output_dir / "raw").iterdir()))
+                camera.close.assert_called_once()
+                slm.close.assert_called_once()
+
+    def test_windows_preview_opens_saved_image_path(self):
+        preview_path = Path("data") / "run with spaces" / "reference" / "fringe_only.png"
+        with (
+            patch("acquire_slm_camera.sys.platform", "win32"),
+            patch("acquire_slm_camera.os.startfile", create=True) as open_image,
+            patch("acquire_slm_camera.subprocess.Popen") as launch_process,
+        ):
+            open_fringe_preview(preview_path)
+        open_image.assert_called_once_with(str(preview_path.resolve()))
+        launch_process.assert_not_called()
 
 
 if __name__ == "__main__":

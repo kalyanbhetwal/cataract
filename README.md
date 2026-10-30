@@ -194,10 +194,47 @@ throughout the sequence. Each display update uses `--settle-ms` and
 ROI is set to the full sensor and both orders lie within its field of view.
 
 The fringe reference is extra: `--num-patterns 3 --capture-fringe-first` saves
-four frames total (one fringe reference and three random-plus-fringe frames).
+four frames total before any steering retries (one fringe reference and three
+random-plus-fringe frames). Each adjustment or recapture adds another reference.
 The random pattern seed and numbering are unchanged by the initial reference.
 The full reference is saved as `reference/fringe_only.npy` plus a PNG preview;
 the following frames use the usual `raw/` and `previews/` directories.
+
+The commands also enable `--confirm-fringe-preview`. After saving the fringe
+reference, the script opens `reference/fringe_only.png` in the default image
+viewer and waits for terminal feedback while the fringe remains on the SLM:
+
+```text
+Are zero and first orders separated? Proceed with random phase patterns? [Y/N, P pixels, R, H, V, C]:
+```
+
+At this prompt you can adjust the steering and capture another preview:
+
+- `P 20`: set a 20-pixel fringe period; `P -20` selects the opposite ramp slope.
+  The signed period must be finite and have an absolute value of at least 2 pixels.
+- `R`: reverse the current ramp slope.
+- `H` / `V`: select horizontal / vertical fringe lines.
+- `C`: capture a fresh fringe-only image, for example after a physical adjustment.
+- `Y`: accept the current fringe and begin the random-plus-fringe measurements.
+- `N`: stop and close the devices, retaining all captured references.
+
+Each adjustment applies the fringe, waits for settling, discards buffered frames,
+saves a new full-frame NPY/PNG, and opens that preview for another decision.
+The printed sampled period accounts for equivalent ramps on the pixel grid;
+its sign describes ramp direction. Confirm the actual steering in the camera
+image. The initial slope still defaults to `4*pi/3`; to choose initial spacing
+directly, pass `--fringe-period-pixels 20` (or a negative period). This option
+is mutually exclusive with `--fringe-slope-rad-per-pixel`.
+
+Random patterns use the accepted fringe with their original seeded coefficient
+sequence. `manifest.json` records the final configuration, every reference and
+its feedback in `fringe_references`, and the latest reference in `fringe_reference`.
+The first preview is `reference/fringe_only.png`; retries have unique names such
+as `reference/fringe_only_0002.png`, so previous captures are retained.
+Invalid/blank commands repeat the prompt; unavailable terminal input stops the
+run. If the viewer cannot open automatically, open the printed PNG path manually.
+`--confirm-fringe-preview` enables `--capture-fringe-first` automatically when
+used alone.
 
 To select only the first order later, inspect the full-frame PNG and supply
 its raw-camera `(x, y)` position with `--crop-center-x` and `--crop-center-y`,
@@ -269,6 +306,11 @@ Useful options:
 - `--save-full-patterns`: retain every 1080 x 1920 displayed phase array.
 - `--capture-fringe-first`: capture a full-frame pure fringe reference before
   the requested random-plus-fringe measurements; the reference phase is also saved.
+- `--confirm-fringe-preview`: open the fringe reference and require a `Y/N`
+  response before random phase patterns, with steering and recapture controls;
+  also enables the reference capture.
+- `--fringe-period-pixels 20`: choose initial fringe spacing using a signed
+  period in SLM pixels instead of `--fringe-slope-rad-per-pixel`.
 - `--no-neuws-processing`: retain raw frames but skip scaling/cropping.
 - `--output-format npy`: avoid the SciPy MAT-file dependency.
 - `--discard-frames N`: discard buffered PySpin frames after each SLM update.

@@ -5,12 +5,16 @@
 # Current workflow: capture the fringe alone first, then add random phase to the same fringe.
 # Save the full camera field so zero and first orders are included when both are on the sensor.
 # --num-patterns counts random-plus-fringe frames; --capture-fringe-first adds one reference frame.
+# --confirm-fringe-preview opens the first camera image and holds the fringe until you answer Y or N in the terminal.
+# At the preview prompt: P 20 sets a 20-pixel fringe period; P -20 sets the opposite slope; R reverses the current ramp; H/V selects horizontal/vertical fringe lines; C captures a fresh preview.
+# Each adjustment captures another full-frame reference. Y uses the accepted fringe for all random phase patterns; N stops.
+# Optional initial spacing: add --fringe-period-pixels 20 to an acquisition command. The default slope remains 4*pi/3 rad/pixel.
 
 # Install Python dependencies.
 python -m pip install -r requirements.txt
 
-# Simulate the full sequence: one horizontal-fringe reference plus 3 random-plus-fringe frames (4 saved frames total).
-python acquire_slm_camera.py --dry-run --capture-fringe-first --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --output-format npy --save-full-patterns
+# Simulate the full sequence with preview feedback: answer Y for 3 more simulated frames, or N to stop. Simulated frames test software flow, not optical order separation.
+python acquire_slm_camera.py --dry-run --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --output-format npy --save-full-patterns
 
 # Run the automated software tests without hardware.
 python -m unittest -v test_acquire_slm_camera.py
@@ -24,8 +28,8 @@ $env:HEDS_EXAMPLES_DIR = "C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Py
 # Optional fringe-only check: capture both orders in one full frame with no random phase. Open data\find_steered_order\previews\frame_0001.png.
 python acquire_slm_camera.py --num-patterns 1 --coefficient-std-rad 0 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --no-neuws-processing --save-full-patterns --output-format npy --output-dir data\find_steered_order
 
-# Capture both orders: one pure horizontal-fringe reference, then 3 random-plus-fringe measurements (4 saved frames total). Each SLM update settles for 300 ms before 2 buffered frames are discarded.
-python acquire_slm_camera.py --capture-fringe-first --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\hardware_test_001
+# Capture the fringe, adjust steering with P/R/H/V/C as needed, then answer Y to capture 3 random-plus-fringe frames, or N to stop. At least 4 saved frames after Y; every adjustment adds a reference. Each SLM update settles for 300 ms and discards 2 camera frames.
+python acquire_slm_camera.py --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\hardware_test_001
 
-# Capture both orders for a full run: one fringe reference plus 100 random-plus-fringe measurements (101 saved frames total). Use a new output directory each time.
-python acquire_slm_camera.py --capture-fringe-first --num-patterns 100 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\measurement_001
+# Full run with the same steering controls and Y/N check: fringe references plus 100 random-plus-fringe measurements after Y. Use a new output directory each time.
+python acquire_slm_camera.py --capture-fringe-first --confirm-fringe-preview --num-patterns 100 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\measurement_001
