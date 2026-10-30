@@ -53,6 +53,8 @@ def test_config(seed=7):
         heds_api_minor=2,
         magnification=3.57,
         crop_size=32,
+        crop_center_x=None,
+        crop_center_y=None,
         neuws_processing=True,
         output_format="npy",
         save_full_patterns=False,
@@ -119,6 +121,19 @@ class PatternTests(unittest.TestCase):
         self.assertEqual(processed.shape, (32, 32))
         self.assertEqual(processed.dtype, np.uint16)
 
+    def test_processing_crops_around_steered_order_coordinate(self):
+        frame = np.zeros((100, 100), dtype=np.uint16)
+        frame[25, 75] = 65535
+        processed = process_neuws_frame(
+            frame,
+            magnification=1.0,
+            crop_size=20,
+            crop_center_x=75,
+            crop_center_y=25,
+        )
+        self.assertEqual(processed.shape, (20, 20))
+        self.assertEqual(int(processed[10, 10]), 65535)
+
     def test_explicit_heds_examples_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             examples_dir = Path(directory)
@@ -179,6 +194,8 @@ class PatternTests(unittest.TestCase):
         config = config_from_args(parser.parse_args(["--dry-run"]))
         self.assertEqual(config.camera_backend, "pyspin")
         self.assertEqual(config.fringe_orientation, "vertical")
+        self.assertIsNone(config.crop_center_x)
+        self.assertIsNone(config.crop_center_y)
         self.assertEqual(config.discard_frames, 1)
         self.assertEqual(config.pixel_format, "auto")
 

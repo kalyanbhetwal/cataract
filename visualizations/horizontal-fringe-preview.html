@@ -1,0 +1,176 @@
+<div id="horizontal-fringe-preview">
+  <style>
+    #horizontal-fringe-preview {
+      color: var(--foreground);
+      width: 100%;
+    }
+    #horizontal-fringe-preview .viz-heading {
+      padding-right: 96px;
+      margin-bottom: 16px;
+    }
+    #horizontal-fringe-preview .viz-equation {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 16px;
+      color: var(--muted-foreground);
+    }
+    #horizontal-fringe-preview .viz-equation strong {
+      color: var(--foreground);
+      font-weight: 500;
+    }
+    #horizontal-fringe-preview .viz-panels {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 18px;
+    }
+    #horizontal-fringe-preview figure {
+      margin: 0;
+      min-width: 0;
+    }
+    #horizontal-fringe-preview figcaption {
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    #horizontal-fringe-preview canvas {
+      display: block;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      border: 1px solid var(--border);
+      image-rendering: pixelated;
+    }
+    #horizontal-fringe-preview .viz-axis {
+      display: flex;
+      justify-content: space-between;
+      margin-top: 6px;
+      color: var(--muted-foreground);
+    }
+    #horizontal-fringe-preview .viz-legend {
+      display: grid;
+      grid-template-columns: auto minmax(120px, 280px) auto;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 16px;
+      color: var(--muted-foreground);
+    }
+    #horizontal-fringe-preview .viz-gradient {
+      height: 12px;
+      background: linear-gradient(to right, var(--background), var(--foreground));
+    }
+    @media (max-width: 640px) {
+      #horizontal-fringe-preview .viz-panels {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+
+  <div class="viz-heading">
+    <h2>Horizontal fringe composition</h2>
+    <div class="text-small text-muted">Representative magnified center strip · 24 physical SLM rows</div>
+  </div>
+
+  <div class="viz-equation" aria-label="Adjusted phase plus horizontal ramp, wrapped from zero to two pi, produces the displayed SLM phase">
+    <strong>Adjusted phase</strong><span>+</span><strong>y-axis ramp</strong><span>→ wrap 0–2π →</span><strong>Displayed phase</strong>
+  </div>
+
+  <div class="viz-panels">
+    <figure>
+      <figcaption>Adjusted Zernike phase</figcaption>
+      <canvas id="hfp-adjusted" width="320" height="192" role="img" aria-label="Smooth adjusted Zernike phase over a magnified center strip"></canvas>
+      <div class="viz-axis text-small"><span>← x</span><span>1920 pixels →</span></div>
+    </figure>
+    <figure>
+      <figcaption>Horizontal fringe ramp</figcaption>
+      <canvas id="hfp-ramp" width="320" height="192" role="img" aria-label="Horizontal phase fringe lines produced by a ramp varying from top to bottom"></canvas>
+      <div class="viz-axis text-small"><span>y ramp ↓</span><span>4π/3 rad per pixel</span></div>
+    </figure>
+    <figure>
+      <figcaption>Final wrapped SLM phase</figcaption>
+      <canvas id="hfp-final" width="320" height="192" role="img" aria-label="Adjusted phase with horizontal fringe ramp added and wrapped between zero and two pi"></canvas>
+      <div class="viz-axis text-small"><span>horizontal lines</span><span>period: 3 rows</span></div>
+    </figure>
+  </div>
+
+  <div class="viz-legend text-small" aria-label="Phase grayscale from zero to two pi">
+    <span>0</span><div class="viz-gradient"></div><span>2π</span>
+  </div>
+
+  <script>
+    (() => {
+      const root = document.getElementById('horizontal-fringe-preview');
+      const tau = 2 * Math.PI;
+      const slope = 4 * Math.PI / 3;
+
+      function rgb(variable) {
+        const probe = document.createElement('span');
+        probe.style.color = `var(${variable})`;
+        probe.style.display = 'none';
+        root.appendChild(probe);
+        const value = getComputedStyle(probe).color;
+        probe.remove();
+        const channels = value.match(/[\d.]+/g).map(Number);
+        return channels.slice(0, 3);
+      }
+
+      function mix(a, b, t) {
+        return [0, 1, 2].map(i => Math.round(a[i] + (b[i] - a[i]) * t));
+      }
+
+      function wrap(value) {
+        return ((value % tau) + tau) % tau;
+      }
+
+      function adjustedPhase(x, row) {
+        const nx = x * 2 - 1;
+        const ny = (row - 11.5) / 70;
+        const radius2 = nx * nx + ny * ny;
+        return wrap(
+          1.1 +
+          1.7 * nx -
+          0.9 * ny +
+          2.2 * (2 * radius2 - 1) +
+          1.1 * nx * ny +
+          0.75 * (3 * nx * nx * nx - 2 * nx)
+        );
+      }
+
+      function draw(canvasId, phaseAt) {
+        const canvas = document.getElementById(canvasId);
+        const context = canvas.getContext('2d');
+        const background = rgb('--background');
+        const foreground = rgb('--foreground');
+        const image = context.createImageData(canvas.width, canvas.height);
+        const rowScale = canvas.height / 24;
+
+        for (let py = 0; py < canvas.height; py++) {
+          const slmRow = Math.min(23, Math.floor(py / rowScale));
+          for (let px = 0; px < canvas.width; px++) {
+            const phase = wrap(phaseAt(px / (canvas.width - 1), slmRow));
+            const shade = mix(background, foreground, phase / tau);
+            const index = (py * canvas.width + px) * 4;
+            image.data[index] = shade[0];
+            image.data[index + 1] = shade[1];
+            image.data[index + 2] = shade[2];
+            image.data[index + 3] = 255;
+          }
+        }
+        context.putImageData(image, 0, 0);
+      }
+
+      function render() {
+        draw('hfp-adjusted', (x, row) => adjustedPhase(x, row));
+        draw('hfp-ramp', (_x, row) => slope * row);
+        draw('hfp-final', (x, row) => adjustedPhase(x, row) + slope * row);
+      }
+
+      render();
+      new MutationObserver(render).observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style']
+      });
+    })();
+  </script>
+</div>

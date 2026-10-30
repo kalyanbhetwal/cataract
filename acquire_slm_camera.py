@@ -54,6 +54,8 @@ class ExperimentConfig:
     heds_api_minor: int
     magnification: float
     crop_size: int
+    crop_center_x: Optional[float]
+    crop_center_y: Optional[float]
     neuws_processing: bool
     output_format: str
     save_full_patterns: bool
@@ -155,8 +157,14 @@ def resize_bilinear(array: np.ndarray, output_shape: tuple[int, int]) -> np.ndar
     return resized
 
 
-def process_neuws_frame(frame: np.ndarray, magnification: float, crop_size: int) -> np.ndarray:
-    """Apply the paper's magnification correction and centered 256-pixel crop."""
+def process_neuws_frame(
+    frame: np.ndarray,
+    magnification: float,
+    crop_size: int,
+    crop_center_x: Optional[float] = None,
+    crop_center_y: Optional[float] = None,
+) -> np.ndarray:
+    """Downscale, then crop around a selected location in raw-camera coordinates."""
     if magnification <= 0:
         raise ValueError("Magnification must be positive")
     scaled_shape = (
@@ -168,11 +176,29 @@ def process_neuws_frame(frame: np.ndarray, magnification: float, crop_size: int)
         raise ValueError(
             f"Scaled frame {scaled.shape} is smaller than requested {crop_size}x{crop_size} crop"
         )
-    row_start = (scaled.shape[0] - crop_size) // 2
-    column_start = (scaled.shape[1] - crop_size) // 2
+    if crop_center_x is None:
+        column_start = (scaled.shape[1] - crop_size) // 2
+    else:
+        scaled_center_x = crop_center_x * scaled.shape[1] / frame.shape[1]
+        column_start = int(round(scaled_center_x - crop_size / 2.0))
+    if crop_center_y is None:
+        row_start = (scaled.shape[0] - crop_size) // 2
+    else:
+        scaled_center_y = crop_center_y * scaled.shape[0] / frame.shape[0]
+        row_start = int(round(scaled_center_y - crop_size / 2.0))
+
+    row_end = row_start + crop_size
+    column_end = column_start + crop_size
+    if row_start < 0 or column_start < 0 or row_end > scaled.shape[0] or column_end > scaled.shape[1]:
+        requested_x = crop_center_x if crop_center_x is not None else frame.shape[1] / 2.0
+        requested_y = crop_center_y if crop_center_y is not None else frame.shape[0] / 2.0
+        raise ValueError(
+            f"Crop centered at raw camera coordinate ({requested_x:.1f}, {requested_y:.1f}) "
+            f"falls outside the frame after {magnification:g}x downscaling"
+        )
     return scaled[
-        row_start : row_start + crop_size,
-        column_start : column_start + crop_size,
+        row_start:row_end,
+        column_start:column_end,
     ].copy()
 
 
@@ -931,14 +957,24 @@ class OutputWriter:
 
         processed = None
         processed_path: Optional[Path] = None
+        processed_preview_path: Optional[Path] = None
+        processed_preview_low: Optional[float] = None
+        processed_preview_high: Optional[float] = None
         if self.config.neuws_processing:
             processed = process_neuws_frame(
                 frame,
                 self.config.magnification,
                 self.config.crop_size,
+                self.config.crop_center_x,
+                self.config.crop_center_y,
             )
             processed_path = self.processed_dir / f"frame_{number:04d}.npy"
             np.save(processed_path, processed, allow_pickle=False)
+            processed_preview_path = self.preview_dir / f"processed_{number:04d}.png"
+            processed_preview, processed_preview_low, processed_preview_high = make_preview_u8(
+                processed
+            )
+            self._image_class.fromarray(processed_preview).save(processed_preview_path)
 
         if self._savemat is not None:
             measurement_for_mat = processed if processed is not None else frame
@@ -962,6 +998,13 @@ class OutputWriter:
             "processed_path": (
                 str(processed_path.relative_to(self.output_dir)) if processed_path else None
             ),
+            "processed_preview_path": (
+                str(processed_preview_path.relative_to(self.output_dir))
+                if processed_preview_path
+                else None
+            ),
+            "processed_preview_scale_1st_percentile": processed_preview_low,
+            "processed_preview_scale_99th_percentile": processed_preview_high,
             "modulation_path": str(modulation_path.relative_to(self.output_dir)),
             "full_pattern_path": (
                 str(full_pattern_path.relative_to(self.output_dir)) if full_pattern_path else None
@@ -1118,6 +1161,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--magnification", type=float, default=3.57)
     parser.add_argument("--crop-size", type=positive_int, default=256)
     parser.add_argument(
+        "--crop-center-x",
+        type=nonnegative_float,
+        default=None,
+        metavar="PIXEL",
+        help="Horizontal center of the steered order in raw camera pixels",
+    )
+    parser.add_argument(
+        "--crop-center-y",
+        type=nonnegative_float,
+        default=None,
+        metavar="PIXEL",
+        help="Vertical center of the steered order in raw camera pixels",
+    )
+    parser.add_argument(
         "--no-neuws-processing",
         action="store_true",
         help="Do not create the 3.57x downscaled center crop",
@@ -1175,6 +1232,8 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         heds_api_minor=args.heds_api_version[1],
         magnification=args.magnification,
         crop_size=args.crop_size,
+        crop_center_x=args.crop_center_x,
+        crop_center_y=args.crop_center_y,
         neuws_processing=not args.no_neuws_processing,
         output_format=args.output_format,
         save_full_patterns=args.save_full_patterns,

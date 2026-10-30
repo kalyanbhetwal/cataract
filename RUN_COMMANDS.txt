@@ -1,11 +1,13 @@
 # Windows PowerShell commands. Run one command at a time from this project directory.
 # Replace the HEDS path, camera serial, and wavelength with the values for your setup.
+# "horizontal" means horizontal fringe lines; the phase ramp varies top-to-bottom along y.
+# If you instead need horizontal beam steering along x, use vertical fringe lines.
 
 # Install Python dependencies.
 python -m pip install -r requirements.txt
 
-# Simulate both the 1920x1200 SLM and camera, recording exactly 3 simulated measurements.
-python acquire_slm_camera.py --dry-run --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation vertical --output-format npy --save-full-patterns
+# Simulate both the 1920x1200 SLM and camera with horizontal fringe lines, recording exactly 3 simulated measurements.
+python acquire_slm_camera.py --dry-run --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --output-format npy --save-full-patterns
 
 # Run the automated software tests without hardware.
 python -m unittest -v test_acquire_slm_camera.py
@@ -16,8 +18,11 @@ python camera_smoke_test.py --camera-serial YOUR_CAMERA_SERIAL --exposure-ms 100
 # Tell the current PowerShell session where the HOLOEYE SDK examples directory is located.
 $env:HEDS_EXAMPLES_DIR = "C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.2.1\examples"
 
-# Record exactly 3 real measurements: display 3 SLM patterns and save one camera frame per pattern.
-python acquire_slm_camera.py --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation vertical --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-dir data\hardware_test_001
+# Display a pure horizontal fringe ramp and capture one full camera frame to locate the steered first order. Open data\find_steered_order\previews\frame_0001.png and note its center pixel coordinates.
+python acquire_slm_camera.py --num-patterns 1 --coefficient-std-rad 0 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --no-neuws-processing --save-full-patterns --output-format npy --output-dir data\find_steered_order
 
-# Example full run recording exactly 100 real measurements; use a new output directory each time.
-python acquire_slm_camera.py --num-patterns 100 --slm-width 1920 --slm-height 1200 --fringe-orientation vertical --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-dir data\measurement_001
+# Record exactly 3 real measurements centered on the steered first order. Replace STEERED_X_PIXEL and STEERED_Y_PIXEL using coordinates from the full-frame preview.
+python acquire_slm_camera.py --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --crop-center-x STEERED_X_PIXEL --crop-center-y STEERED_Y_PIXEL --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\hardware_test_001
+
+# Example full run recording exactly 100 real measurements centered on the steered first order; use a new output directory each time.
+python acquire_slm_camera.py --num-patterns 100 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --crop-center-x STEERED_X_PIXEL --crop-center-y STEERED_Y_PIXEL --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --save-full-patterns --output-dir data\measurement_001

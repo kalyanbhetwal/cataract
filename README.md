@@ -184,6 +184,16 @@ saturating. Set `--wavelength-nm` to your actual laser wavelength because
 HOLOEYE uses it for phase modulation; do not retain 532 nm if your laser is
 different. Keep the beam blocked while testing software/device selection.
 
+The phase ramp produces a displaced diffraction order as well as a static
+zero order. First run one pure-ramp measurement using
+`--coefficient-std-rad 0 --no-neuws-processing`, then open the saved full-frame
+PNG and note the displaced order's raw-camera `(x, y)` pixel location. Supply
+that location with `--crop-center-x` and `--crop-center-y` for the acquisition.
+The full raw frame remains saved even when the processed output is centered on
+the selected first order. If the orders overlap or the first order lies off the
+sensor, change the optical alignment/ramp or use a Fourier-plane spatial stop;
+software cropping cannot separate overlapping orders.
+
 For a color Grasshopper3, select an unpacked 16-bit Bayer format supported by
 the camera, such as `BayerRG16`, instead of `Mono16`. Check the supported pixel
 formats in SpinView. The script discards `--discard-frames` buffered frames
@@ -220,6 +230,7 @@ sample_001/
   manifest.json
   raw/frame_0001.npy
   previews/frame_0001.png
+  previews/processed_0001.png
   processed/frame_0001.npy
   patterns/phase_modulation_0001.npy
   neuws_mat/SLM_raw1.mat
@@ -229,8 +240,12 @@ sample_001/
 The full sensor frame is always retained unchanged in `raw/`. `previews/`
 contains viewable 8-bit PNGs scaled between each frame's 1st and 99th
 percentiles; these previews are for inspection rather than quantitative use.
-`processed/` contains the 3.57x downscaled, centered 256 x 256 image. The MAT
-files use the variable and filename conventions expected by the public NeuWS reconstruction code:
+`processed/` contains the 3.57x downscaled 256 x 256 measurement. By default
+it is centered on the sensor. To select a displaced first diffraction order
+instead of the static zero order, inspect `previews/frame_0001.png`, determine
+the first-order center in raw camera pixels, and pass `--crop-center-x X` and
+`--crop-center-y Y`. `previews/processed_0001.png` shows the selected crop.
+The MAT files use the variable and filename conventions expected by the public NeuWS reconstruction code:
 `imsdata` in `SLM_rawN.mat` and `proj_sim` in `SLM_simN.mat`.
 
 `manifest.json` records all settings, Zernike coefficients, file paths, camera
@@ -249,6 +264,8 @@ Useful options:
 - `--playerone-sdk-dir PATH`: locate the Player One SDK root or `python` folder.
 - `--camera-backend playerone`: switch from the default PySpin camera.
 - `--wavelength-nm 532`: select the wavelength used by HOLOEYE's phase lookup.
+- `--crop-center-x X --crop-center-y Y`: center processed output on the
+  steered diffraction order using raw-camera pixel coordinates.
 - `--fringe-orientation vertical`: use vertical fringe lines (the default),
   with phase varying along x. Use `horizontal` to vary phase along y instead.
 
