@@ -184,15 +184,24 @@ saturating. Set `--wavelength-nm` to your actual laser wavelength because
 HOLOEYE uses it for phase modulation; do not retain 532 nm if your laser is
 different. Keep the beam blocked while testing software/device selection.
 
-The phase ramp produces a displaced diffraction order as well as a static
-zero order. First run one pure-ramp measurement using
-`--coefficient-std-rad 0 --no-neuws-processing`, then open the saved full-frame
-PNG and note the displaced order's raw-camera `(x, y)` pixel location. Supply
-that location with `--crop-center-x` and `--crop-center-y` for the acquisition.
-The full raw frame remains saved even when the processed output is centered on
-the selected first order. If the orders overlap or the first order lies off the
-sensor, change the optical alignment/ramp or use a Fourier-plane spatial stop;
-software cropping cannot separate overlapping orders.
+For the current 1920 x 1200 setup, the commands in `RUN_COMMANDS.txt` use
+horizontal fringe lines and retain both zero and first orders in the same
+camera frame. Use `--capture-fringe-first --no-neuws-processing` to capture
+the pure steering fringe first, then add each random phase pattern to that
+same fringe and capture another full frame. The SLM and camera stay open
+throughout the sequence. Each display update uses `--settle-ms` and
+`--discard-frames`, including the initial fringe reference. Ensure the camera
+ROI is set to the full sensor and both orders lie within its field of view.
+
+The fringe reference is extra: `--num-patterns 3 --capture-fringe-first` saves
+four frames total (one fringe reference and three random-plus-fringe frames).
+The random pattern seed and numbering are unchanged by the initial reference.
+The full reference is saved as `reference/fringe_only.npy` plus a PNG preview;
+the following frames use the usual `raw/` and `previews/` directories.
+
+To select only the first order later, inspect the full-frame PNG and supply
+its raw-camera `(x, y)` position with `--crop-center-x` and `--crop-center-y`,
+omitting `--no-neuws-processing`. Full raw frames are still retained.
 
 For a color Grasshopper3, select an unpacked 16-bit Bayer format supported by
 the camera, such as `BayerRG16`, instead of `Mono16`. Check the supported pixel
@@ -251,10 +260,15 @@ The MAT files use the variable and filename conventions expected by the public N
 `manifest.json` records all settings, Zernike coefficients, file paths, camera
 frame identifiers, and display/capture timestamps. It is rewritten after each
 successful frame, so completed data remains described if acquisition stops.
+When `--capture-fringe-first` is used, the `fringe_reference` entry records the
+initial reference files and timestamps. `frames_completed` counts only the
+subsequent frames requested by `--num-patterns`.
 
 Useful options:
 
 - `--save-full-patterns`: retain every 1080 x 1920 displayed phase array.
+- `--capture-fringe-first`: capture a full-frame pure fringe reference before
+  the requested random-plus-fringe measurements; the reference phase is also saved.
 - `--no-neuws-processing`: retain raw frames but skip scaling/cropping.
 - `--output-format npy`: avoid the SciPy MAT-file dependency.
 - `--discard-frames N`: discard buffered PySpin frames after each SLM update.

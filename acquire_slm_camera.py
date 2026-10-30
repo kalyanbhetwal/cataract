@@ -61,6 +61,7 @@ class ExperimentConfig:
     save_full_patterns: bool
     require_16_bit: bool
     dry_run: bool
+    capture_fringe_first: bool = False
 
 
 def noll_indices(count: int) -> list[tuple[int, int]]:
@@ -254,6 +255,13 @@ class NeuWSPatternGenerator:
             raise ValueError(
                 f"Unsupported fringe orientation: {config.fringe_orientation!r}"
             )
+
+    def fringe_only(self) -> np.ndarray:
+        """Return the steering fringe without advancing the random sequence."""
+        displayed_phase = self._fringe.astype(np.float32)
+        maximum_phase = np.nextafter(np.float32(TWO_PI), np.float32(0.0))
+        np.minimum(displayed_phase, maximum_phase, out=displayed_phase)
+        return displayed_phase
 
     def next(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         coefficients = self._rng.normal(
@@ -929,6 +937,40 @@ class OutputWriter:
             self.neuws_dir.mkdir(parents=True, exist_ok=True)
         self.config = config
         self.records: list[dict[str, Any]] = []
+        self.fringe_reference: Optional[dict[str, Any]] = None
+
+    def save_fringe_reference(
+        self,
+        frame: np.ndarray,
+        displayed_phase: np.ndarray,
+        camera_metadata: dict[str, Any],
+        display_time_ns: int,
+        capture_time_ns: int,
+    ) -> None:
+        """Save an uncropped fringe-only reference separately from random frames."""
+        reference_dir = self.output_dir / "reference"
+        reference_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = reference_dir / "fringe_only.npy"
+        preview_path = reference_dir / "fringe_only.png"
+        phase_path = reference_dir / "phase_slm.npy"
+        np.save(raw_path, frame, allow_pickle=False)
+        preview, preview_low, preview_high = make_preview_u8(frame)
+        self._image_class.fromarray(preview).save(preview_path)
+        np.save(phase_path, displayed_phase, allow_pickle=False)
+        self.fringe_reference = {
+            "pattern_type": "fringe_only",
+            "raw_path": str(raw_path.relative_to(self.output_dir)),
+            "preview_path": str(preview_path.relative_to(self.output_dir)),
+            "preview_scale_1st_percentile": preview_low,
+            "preview_scale_99th_percentile": preview_high,
+            "full_pattern_path": str(phase_path.relative_to(self.output_dir)),
+            "display_time_ns": display_time_ns,
+            "capture_time_ns": capture_time_ns,
+            "frame_dtype": str(frame.dtype),
+            "frame_shape": list(frame.shape),
+            **camera_metadata,
+        }
+        self._write_manifest()
 
     def save(
         self,
@@ -1025,6 +1067,7 @@ class OutputWriter:
             "reference": "sciadv.adg4671_sm.pdf, pages 3-5",
             "configuration": asdict(self.config),
             "frames_completed": len(self.records),
+            "fringe_reference": self.fringe_reference,
             "frames": self.records,
         }
         temporary_path = self.output_dir / "manifest.json.tmp"
@@ -1074,10 +1117,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Display NeuWS random-Zernike SLM patterns and record one camera frame each."
     )
-    parser.add_argument("--num-patterns", type=positive_int, default=100)
+    parser.add_argument(
+        "--num-patterns",
+        type=positive_int,
+        default=100,
+        help="Number of random-plus-fringe frames, excluding the optional fringe reference",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Use simulated SLM and camera")
+    parser.add_argument(
+        "--capture-fringe-first",
+        action="store_true",
+        help="Capture a full-frame pure fringe reference before adding random phase patterns",
+    )
     parser.add_argument("--zernike-modes", type=positive_int, default=15)
     parser.add_argument("--coefficient-std-rad", type=float, default=5.0)
     parser.add_argument(
@@ -1239,6 +1292,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         save_full_patterns=args.save_full_patterns,
         require_16_bit=not args.allow_non_16_bit,
         dry_run=args.dry_run,
+        capture_fringe_first=args.capture_fringe_first,
     )
 
 
@@ -1252,16 +1306,37 @@ def run(config: ExperimentConfig, output_dir: Path) -> None:
         camera = PlayerOneCamera(config)
     else:
         camera = PySpinCamera(config)
+
+    def display_and_capture(
+        phase: np.ndarray,
+    ) -> tuple[np.ndarray, dict[str, Any], int, int]:
+        slm.show(phase)
+        display_time_ns = time.time_ns()
+        time.sleep(config.settle_ms / 1000.0)
+        frame, camera_metadata = camera.capture(phase)
+        return frame, camera_metadata, display_time_ns, time.time_ns()
+
     try:
         slm.open()
         camera.open()
+        if config.capture_fringe_first:
+            fringe_phase = generator.fringe_only()
+            frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
+                fringe_phase
+            )
+            writer.save_fringe_reference(
+                frame,
+                fringe_phase,
+                camera_metadata,
+                display_time_ns,
+                capture_time_ns,
+            )
+            print(f"[reference] saved fringe-only {frame.shape} {frame.dtype} frame")
         for index in range(config.num_patterns):
             displayed_phase, modulation, coefficients = generator.next()
-            slm.show(displayed_phase)
-            display_time_ns = time.time_ns()
-            time.sleep(config.settle_ms / 1000.0)
-            frame, camera_metadata = camera.capture(displayed_phase)
-            capture_time_ns = time.time_ns()
+            frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
+                displayed_phase
+            )
             writer.save(
                 index,
                 frame,

@@ -1,3 +1,4 @@
+import json
 import math
 import sys
 import tempfile
@@ -6,6 +7,7 @@ from dataclasses import replace
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -22,6 +24,7 @@ from acquire_slm_camera import (
     phase_to_u8,
     process_neuws_frame,
     resize_nearest,
+    run,
     zernike_basis,
 )
 
@@ -194,6 +197,7 @@ class PatternTests(unittest.TestCase):
         config = config_from_args(parser.parse_args(["--dry-run"]))
         self.assertEqual(config.camera_backend, "pyspin")
         self.assertEqual(config.fringe_orientation, "vertical")
+        self.assertFalse(config.capture_fringe_first)
         self.assertIsNone(config.crop_center_x)
         self.assertIsNone(config.crop_center_y)
         self.assertEqual(config.discard_frames, 1)
@@ -215,6 +219,110 @@ class PatternTests(unittest.TestCase):
         self.assertAlmostEqual(high, 98.01)
         self.assertEqual(int(preview[0, 0]), 0)
         self.assertEqual(int(preview[-1, -1]), 255)
+
+
+class AcquisitionSequenceTests(unittest.TestCase):
+    def test_fringe_reference_then_random_phase_preserves_full_camera_frames(self):
+        parser = build_parser()
+        config = config_from_args(
+            parser.parse_args(
+                [
+                    "--dry-run", "--capture-fringe-first", "--num-patterns", "2",
+                    "--fringe-orientation", "horizontal", "--settle-ms", "300",
+                    "--no-neuws-processing", "--output-format", "npy",
+                    "--save-full-patterns",
+                ]
+            )
+        )
+        config = replace(config, slm_height=108, slm_width=192)
+        # Two separated signals stand in for both orders in one camera frame.
+        full_frame = np.arange(12 * 16, dtype=np.uint16).reshape(12, 16)
+        full_frame[6, 8] = 60000
+        full_frame[2, 8] = 30000
+        slm, camera, events = Mock(), Mock(), Mock()
+        camera.capture.side_effect = [
+            (full_frame.copy(), {"frame_id": number}) for number in range(1, 4)
+        ]
+        events.attach_mock(slm.show, "display")
+        events.attach_mock(camera.capture, "capture")
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            with (
+                patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                patch("acquire_slm_camera.time.sleep") as settle,
+            ):
+                events.attach_mock(settle, "settle")
+                run(config, output_dir)
+
+            self.assertEqual(
+                [call[0] for call in events.mock_calls],
+                ["display", "settle", "capture"] * 3,
+            )
+            self.assertEqual([call.args[0] for call in settle.call_args_list], [0.3] * 3)
+            expected_generator = NeuWSPatternGenerator(config)
+            reference_phase = slm.show.call_args_list[0].args[0]
+            np.testing.assert_array_equal(reference_phase, expected_generator.fringe_only())
+            np.testing.assert_array_equal(reference_phase[:, 0], reference_phase[:, -1])
+            self.assertNotEqual(reference_phase[0, 0], reference_phase[1, 0])
+
+            manifest = json.loads((output_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["frames_completed"], 2)
+            self.assertEqual(len(manifest["frames"]), 2)
+            self.assertTrue(manifest["configuration"]["capture_fringe_first"])
+            self.assertFalse((output_dir / "processed").exists())
+            reference = manifest["fringe_reference"]
+            self.assertEqual(reference["frame_id"], 1)
+            self.assertTrue((output_dir / reference["preview_path"]).is_file())
+            np.testing.assert_array_equal(
+                np.load(output_dir / reference["raw_path"]), full_frame
+            )
+            np.testing.assert_array_equal(
+                np.load(output_dir / reference["full_pattern_path"]), reference_phase
+            )
+            for index, record in enumerate(manifest["frames"]):
+                expected_phase, _, expected_coefficients = expected_generator.next()
+                np.testing.assert_array_equal(
+                    slm.show.call_args_list[index + 1].args[0], expected_phase
+                )
+                np.testing.assert_array_equal(
+                    record["zernike_coefficients_rad"], expected_coefficients
+                )
+                np.testing.assert_array_equal(
+                    np.load(output_dir / record["raw_path"]), full_frame
+                )
+                self.assertEqual(record["pattern_index"], index + 1)
+                self.assertEqual(record["frame_id"], index + 2)
+                self.assertIsNone(record["processed_path"])
+                self.assertTrue((output_dir / record["preview_path"]).is_file())
+            slm.open.assert_called_once()
+            camera.open.assert_called_once()
+            camera.close.assert_called_once()
+            slm.close.assert_called_once()
+
+    def test_fringe_reference_survives_later_capture_failure(self):
+        config = replace(test_config(), capture_fringe_first=True, neuws_processing=False)
+        slm, camera = Mock(), Mock()
+        camera.capture.side_effect = [
+            (np.zeros((12, 16), dtype=np.uint16), {"frame_id": 1}),
+            RuntimeError("capture failed"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            with (
+                patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                self.assertRaisesRegex(RuntimeError, "capture failed"),
+            ):
+                run(config, output_dir)
+            manifest = json.loads((output_dir / "manifest.json").read_text())
+            self.assertEqual(manifest["frames_completed"], 0)
+            self.assertEqual(manifest["fringe_reference"]["frame_id"], 1)
+            self.assertTrue(
+                (output_dir / manifest["fringe_reference"]["raw_path"]).is_file()
+            )
+            camera.close.assert_called_once()
+            slm.close.assert_called_once()
 
 
 if __name__ == "__main__":
