@@ -36,12 +36,12 @@ environment provides `python`. Validate without either hardware device:
 
 ```powershell
 python acquire_slm_camera.py --dry-run --num-patterns 3 --output-format npy
-python -m unittest -v test_acquire_slm_camera.py
+python -m unittest -v test_acquire_slm_camera.py test_process_measurements.py test_calibrate_slm_camera.py
 ```
 
 The dry run generates realistic-sized simulated 16-bit frames and exercises
 the same pattern, preprocessing, metadata, and file-writing path as hardware
-mode. Keep the explicit test filename in the second command: broad unittest
+mode. Keep the explicit test filenames in the second command: broad unittest
 discovery also imports the copied vendor `HEDS` package, which expects its
 Windows SDK environment variable and therefore fails on macOS.
 
@@ -65,6 +65,8 @@ camera values. The PNG is an 8-bit preview scaled between the frame's 1st and
 99th percentiles for convenient viewing. For a color camera, use the unpacked
 16-bit Bayer format reported by SpinView, such as `BayerRG16`; its preview is
 still the raw Bayer mosaic, not a demosaiced color image.
+If both percentiles coincide (for example, a tiny aperture on a dark field),
+the preview falls back to the full intensity range so sparse signals stay visible.
 
 ## 2. Install vendor software on the acquisition PC
 
@@ -240,6 +242,11 @@ To select only the first order later, inspect the full-frame PNG and supply
 its raw-camera `(x, y)` position with `--crop-center-x` and `--crop-center-y`,
 omitting `--no-neuws-processing`. Full raw frames are still retained.
 
+The current run commands use `--output-format npy` and omit
+`--save-full-patterns` to reduce disk use. Camera NPY/PNG measurements, small
+phase-modulation arrays, coefficients, and steering settings are retained.
+The full phase array for each fringe-only reference is also retained.
+
 For a color Grasshopper3, select an unpacked 16-bit Bayer format supported by
 the camera, such as `BayerRG16`, instead of `Mono16`. Check the supported pixel
 formats in SpinView. The script discards `--discard-frames` buffered frames
@@ -267,6 +274,122 @@ The Player One adapter uses SDK Snap Mode and loads the correct DLL from
 variable or automatically find a copied `PlayerOne_Camera_SDK*` folder beside
 the script.
 
+## 6. Extract a camera region with its matching phase
+
+Use `process_measurements.py` after acquisition. It opens no hardware and reads
+the unchanged raw NPY measurements rather than contrast-scaled PNGs. Draw a
+rectangle around the steered image on the reference preview, then press Enter:
+
+```powershell
+python process_measurements.py datameasurement_aa --output-dir processed\measurement_aa_selected --include-full-phase
+```
+
+For `datameasurement_aa`, the phase-varying left-hand image is the candidate
+steered component. A suggested camera crop is `(x=300, y=200, width=900,
+height=1100)`. Confirm the outlined region in `roi_preview.png`:
+
+```powershell
+python process_measurements.py datameasurement_aa --roi 300 200 900 1100 --output-dir processed\measurement_aa_steered --include-full-phase
+```
+
+This produces a new dataset containing `pairs/frame_0001.npz`, camera PNGs in
+`previews/`, wrapped random-phase PNGs in `phase_previews/`, `roi.json`, and a
+manifest mapping every output sample to its original pattern index. The camera
+crop keeps the original dtype and values, without resizing or normalization.
+
+Each compressed pair contains:
+
+- `image`: the cropped camera measurement.
+- `phase_modulation_rad`: its original 144 x 256 random phase, before the fringe.
+- `phase_slm_rad`: the full displayed random-plus-fringe phase when
+  `--include-full-phase` is enabled; saved full masks are preferred, otherwise
+  the phase is reconstructed from the recorded coefficients and settings.
+- `zernike_coefficients_rad`, `fringe_slope_rad_per_pixel`,
+  `fringe_orientation`, `slm_shape`, `camera_roi_xywh`, and `source_pattern_index`.
+
+The phase stays in SLM coordinates. Applying the camera ROI to the phase array
+would require optical registration and is not part of this processing. Omit
+`--include-full-phase` for smaller output files; the small modulation and
+coefficients/steering needed to reconstruct the mask are still included.
+
+```python
+import numpy as np
+
+with np.load("processed/measurement_aa_steered/pairs/frame_0001.npz", allow_pickle=False) as sample:
+    image = sample["image"]
+    phase = sample["phase_slm_rad"]
+```
+
+Dark/partial measurements are flagged in the manifest and retained by default.
+Use `--exclude-indices 4 5 6 7 34 60 61 62 89 90` only when you explicitly want
+to omit the previously identified weak frames. Their phases are omitted with
+them, and output numbering stays contiguous while preserving source indices.
+Add `--export-mat` to also write cropped `imsdata` / modulation `proj_sim` MAT
+pairs. Crops are not automatically resampled to the paper's 256 x 256 size.
+All offline commands are also included as single lines in `RUN_COMMANDS.txt`.
+
+## 7. Measure SLM/camera Fourier sampling
+
+`calibrate_slm_camera.py` implements the supplement's aperture/ramp calibration.
+Replace the object with a small aperture, remove the aberrating sample, and
+focus the aperture image. Keep the optical arrangement, camera ROI/binning,
+and wavelength fixed between calibration and acquisition. Run the hardware
+calibration command in `RUN_COMMANDS.txt` on the Windows acquisition PC.
+
+The command starts with the 20-pixel horizontal fringe used for the uploaded
+measurements. On the first camera image, draw a rectangle containing only the
+steered aperture, excluding the static zero order. Leave background margin
+around the spot (at least 24 pixels from its center), then press Enter.
+Ten ramp positions are captured: the carrier, signed offsets on both SLM axes,
+and a return to the carrier. Three raw frames are retained at each position.
+The script checks weak/saturated/edge detections and fits a robust affine map:
+
+```text
+camera_xy = camera_origin + B @ [fx, fy]
+```
+
+`fx` and `fy` are cycles per physical SLM pixel; camera coordinates are raw
+sensor pixels. The 2 x 2 matrix captures axis rotation/reflection and unequal
+scaling. Inspect `calibration_review.png` and answer `Y` only when the marked
+positions correspond to the same steered aperture. A static zero-order spot
+cannot pass the two-axis motion checks. The fit also checks center-return drift.
+Start with 10 ms exposure and adjust as needed to keep the aperture unsaturated;
+`--saturation-level` can specify the actual maximum raw camera value if the
+effective ADC range differs from the uint16 container's maximum of 65535.
+
+Outputs include every raw capture, ramp metadata, median images, phase PNGs,
+the review plot, `detections.json` (including rejected detections), and
+`calibration.json`. The first capture is used to estimate required free disk
+space before the scan continues (roughly 400 MB for 30 raw 2000 x 1500 frames,
+median images, and previews). Only a passing, operator-approved,
+non-synthetic result has `usable_for_hardware: true`. A simulation validates
+the software only; no optical scale is inferred from the old random-pattern
+dataset, which has only one steering carrier.
+
+The result stores the raw frequency-to-camera map and its interpretation on
+a square FFT grid. For a grid with N columns/rows and an active pupil with
+`pupil_rows` rows, the predicted FFT-bin shift per ramp frequency is:
+
+```text
+slm_x: slm_width * fx
+slm_y: (N * slm_height / pupil_rows) * fy
+```
+
+The existing generator/captures use 144 modulation rows, even with a 1920 x
+1200 SLM, so the hardware command explicitly uses `--pupil-rows 144`.
+An aspect-matched full-area 1920 x 1200 pupil on a 256 grid would have 160
+active rows. This model choice changes the normalized FFT sampling, while
+the measured raw optical matrix B is unchanged. The report therefore retains
+B instead of forcing the two axes into one assumed magnification number.
+It does not calibrate the SLM LUT, beam footprint, or direct image-plane
+registration, and does not automatically resize the existing image/phase pairs.
+
+If a spot leaves the search window, reduce `--step-cycles-per-pixel` or adjust
+`--tracking-radius`, while keeping the static zero order outside the search.
+Use `--analyze-only` to refit saved captures without opening hardware, optionally
+with a corrected `--roi`. `--skip-review` saves an unapproved result for later
+inspection. Each run/refit needs a new output directory.
+
 ## Output
 
 Each run contains:
@@ -286,6 +409,7 @@ sample_001/
 The full sensor frame is always retained unchanged in `raw/`. `previews/`
 contains viewable 8-bit PNGs scaled between each frame's 1st and 99th
 percentiles; these previews are for inspection rather than quantitative use.
+If those limits coincide, the full intensity range is used instead.
 `processed/` contains the 3.57x downscaled 256 x 256 measurement. By default
 it is centered on the sensor. To select a displaced first diffraction order
 instead of the static zero order, inspect `previews/frame_0001.png`, determine
@@ -297,6 +421,9 @@ The MAT files use the variable and filename conventions expected by the public N
 `manifest.json` records all settings, Zernike coefficients, file paths, camera
 frame identifiers, and display/capture timestamps. It is rewritten after each
 successful frame, so completed data remains described if acquisition stops.
+Camera measurements are recorded in the manifest before writing a large full
+SLM phase export. If that export fails, its `full_pattern_path` remains null
+and a `full_pattern_save_error` is recorded when disk space permits.
 When `--capture-fringe-first` is used, the `fringe_reference` entry records the
 initial reference files and timestamps. `frames_completed` counts only the
 subsequent frames requested by `--num-patterns`.
@@ -331,4 +458,27 @@ implementation interprets the slope as radians per SLM pixel, records its
 convention and coefficients in the manifest, and keeps those choices isolated
 in `zernike_basis()`, `--fringe-slope-rad-per-pixel`, and `--pixel-format` so
 they can be adjusted without changing the acquisition loop.
+
+### Storage write errors
+
+`OSError: ... requested and 0 written` at `np.save` means the output file
+could not be written. Check available space on the acquisition PC:
+
+```powershell
+Get-PSDrive -PSProvider FileSystem
+```
+
+At 1920 x 1200, each full float32 phase array contains 2,304,000 values and
+needs 9,216,000 bytes (about 9.2 MB), plus the NPY header. One hundred full
+phase files alone need about 0.92 GB, before camera images and other exports.
+Omit `--save-full-patterns` and use `--output-format npy` to avoid optional
+full phase exports and duplicate MAT measurements. Select a new output folder
+on a drive with sufficient space; existing run directories are not overwritten.
+If space is available, check write permissions, quotas, and drive errors.
+
+NPY writes use a temporary file and rename it only after the write succeeds.
+Failed NPY temporary files are removed when possible. Array writes check free
+space and require 1 MiB of working headroom, but concurrent disk activity can
+still exhaust the drive. Saved camera measurements are checkpointed before
+the full phase export so a failure at that step retains their manifest entry.
 # cataract

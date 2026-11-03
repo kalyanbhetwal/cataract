@@ -18,7 +18,9 @@ from acquire_slm_camera import (
     ExperimentConfig,
     HoloeyeSLM,
     NeuWSPatternGenerator,
+    OutputWriter,
     PlayerOneCamera,
+    StorageWriteError,
     build_parser,
     config_from_args,
     main,
@@ -245,6 +247,108 @@ class PatternTests(unittest.TestCase):
         self.assertAlmostEqual(high, 98.01)
         self.assertEqual(int(preview[0, 0]), 0)
         self.assertEqual(int(preview[-1, -1]), 255)
+
+
+class StorageTests(unittest.TestCase):
+    def test_full_phase_write_failure_keeps_camera_data_and_stops_capture(self):
+        config = replace(test_config(), neuws_processing=False, save_full_patterns=True)
+        frame = np.arange(12 * 16, dtype=np.uint16).reshape(12, 16)
+        original_save = np.save
+
+        def fail_full_phase(stream, array, **kwargs):
+            if Path(stream.name).name == "phase_slm_0001.npy.tmp":
+                stream.write(b"incomplete phase data")
+                raise OSError(f"{array.size} requested and 0 written")
+            return original_save(stream, array, **kwargs)
+
+        # A failed follow-up manifest write must still leave the first checkpoint.
+        for metadata_write_fails in (False, True):
+            with self.subTest(metadata_write_fails=metadata_write_fails):
+                with tempfile.TemporaryDirectory() as directory:
+                    output_dir = Path(directory) / "run"
+                    slm, camera = Mock(), Mock()
+                    camera.capture.return_value = (frame.copy(), {"frame_id": 1})
+                    original_manifest = OutputWriter._write_manifest
+                    manifest_calls = 0
+
+                    def write_manifest(writer):
+                        nonlocal manifest_calls
+                        manifest_calls += 1
+                        if metadata_write_fails and manifest_calls == 2:
+                            raise StorageWriteError("drive is still full")
+                        return original_manifest(writer)
+
+                    with (
+                        patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                        patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                        patch("acquire_slm_camera.np.save", side_effect=fail_full_phase),
+                        patch.object(OutputWriter, "_write_manifest", write_manifest),
+                        self.assertRaisesRegex(StorageWriteError, "phase_slm_0001.npy") as error,
+                    ):
+                        run(config, output_dir)
+
+                    self.assertIn("Free space on output drive:", str(error.exception))
+                    manifest = json.loads((output_dir / "manifest.json").read_text())
+                    self.assertEqual(manifest["frames_completed"], 1)
+                    record = manifest["frames"][0]
+                    self.assertIsNone(record["full_pattern_path"])
+                    if not metadata_write_fails:
+                        self.assertIn("requested and 0 written", record["full_pattern_save_error"])
+                    np.testing.assert_array_equal(np.load(output_dir / record["raw_path"]), frame)
+                    self.assertTrue((output_dir / record["preview_path"]).is_file())
+                    self.assertTrue((output_dir / record["modulation_path"]).is_file())
+                    self.assertFalse((output_dir / "patterns" / "phase_slm_0001.npy").exists())
+                    self.assertFalse(any(output_dir.rglob("*.npy.tmp")))
+                    camera.capture.assert_called_once()
+                    camera.close.assert_called_once()
+                    slm.close.assert_called_once()
+
+    def test_reference_phase_write_failure_keeps_reference_camera_files(self):
+        config = test_config()
+        frame = np.arange(12 * 16, dtype=np.uint16).reshape(12, 16)
+        phase = NeuWSPatternGenerator(config).fringe_only()
+        original_save = np.save
+
+        def fail_reference_phase(stream, array, **kwargs):
+            if Path(stream.name).name == "phase_slm.npy.tmp":
+                stream.write(b"incomplete phase data")
+                raise OSError("drive write failed")
+            return original_save(stream, array, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            writer = OutputWriter(output_dir, config)
+            with (
+                patch("acquire_slm_camera.np.save", side_effect=fail_reference_phase),
+                self.assertRaisesRegex(StorageWriteError, "phase_slm.npy"),
+            ):
+                writer.save_fringe_reference(frame, phase, {"frame_id": 1}, 10, 20)
+            manifest = json.loads((output_dir / "manifest.json").read_text())
+            reference = manifest["fringe_reference"]
+            self.assertIsNone(reference["full_pattern_path"])
+            self.assertEqual(reference["frame_id"], 1)
+            np.testing.assert_array_equal(np.load(output_dir / reference["raw_path"]), frame)
+            self.assertTrue((output_dir / reference["preview_path"]).is_file())
+            self.assertIn("drive write failed", reference["full_pattern_save_error"])
+            self.assertFalse(any(output_dir.rglob("*.npy.tmp")))
+
+    def test_insufficient_space_is_reported_before_array_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_dir = Path(directory) / "run"
+            writer = OutputWriter(output_dir, replace(test_config(), neuws_processing=False))
+            phase, modulation, coefficients = NeuWSPatternGenerator(test_config()).next()
+            with (
+                patch("acquire_slm_camera.shutil.disk_usage", return_value=SimpleNamespace(free=0)),
+                patch("acquire_slm_camera.np.save") as save_array,
+                self.assertRaisesRegex(StorageWriteError, "insufficient space") as error,
+            ):
+                writer.save(
+                    0, np.zeros((12, 16), dtype=np.uint16), modulation, phase,
+                    coefficients, {"frame_id": 1}, 10, 20,
+                )
+            self.assertIn("0.0 MiB", str(error.exception))
+            save_array.assert_not_called()
+            self.assertFalse(any(writer.raw_dir.iterdir()))
 
 
 class AcquisitionSequenceTests(unittest.TestCase):

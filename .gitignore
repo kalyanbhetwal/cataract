@@ -8,11 +8,14 @@
 # Acquisition and generated experiment data
 data/
 output/
+/processed/
 tmp/
 *.npy
 SLM_raw*.mat
 SLM_sim*.mat
 manifest.json
+datameasurement_aa/
+analysis/
 
 # Python environments and caches
 .venv/

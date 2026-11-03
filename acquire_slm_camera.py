@@ -14,6 +14,7 @@ import importlib
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -26,6 +27,10 @@ import numpy as np
 
 
 TWO_PI = 2.0 * math.pi
+
+
+class StorageWriteError(RuntimeError):
+    """An acquisition file could not be written to the output drive."""
 
 
 @dataclass(frozen=True)
@@ -206,7 +211,7 @@ def process_neuws_frame(
 
 
 def make_preview_u8(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
-    """Scale the 1st-99th percentile range into a viewable 8-bit preview."""
+    """Scale percentiles, falling back to the full range for sparse spot images."""
     preview_source = frame[:, :, 0] if frame.ndim == 3 and frame.shape[2] == 1 else frame
     if preview_source.ndim not in (2, 3):
         raise ValueError(f"Cannot create a PNG preview from shape {frame.shape}")
@@ -218,6 +223,10 @@ def make_preview_u8(frame: np.ndarray) -> tuple[np.ndarray, float, float]:
     if finite_values.size == 0:
         raise ValueError("Cannot create a PNG preview from an image without finite values")
     low, high = (float(value) for value in np.percentile(finite_values, (1.0, 99.0)))
+    if high <= low:
+        # A small calibration aperture may occupy less than 1% of the sensor.
+        # Preserve that sparse signal instead of replacing it with a black PNG.
+        low, high = float(finite_values.min()), float(finite_values.max())
     if high <= low:
         preview = np.zeros(preview_source.shape, dtype=np.uint8)
     else:
@@ -1012,6 +1021,63 @@ class OutputWriter:
         self.fringe_reference: Optional[dict[str, Any]] = None
         self.fringe_references: list[dict[str, Any]] = []
 
+    def _free_bytes(self) -> Optional[int]:
+        try:
+            return shutil.disk_usage(self.output_dir).free
+        except OSError:
+            return None
+
+    def _storage_error(self, path: Path, detail: str) -> StorageWriteError:
+        free = self._free_bytes()
+        free_text = f"{free / 1024**2:.1f} MiB" if free is not None else "unknown"
+        return StorageWriteError(
+            f"Could not save {path.resolve()}: {detail}. "
+            f"Free space on output drive: {free_text}. "
+            "Check disk space, drive health, and write permissions. "
+            "Choose a new output directory on a drive with enough space; "
+            "omit --save-full-patterns and use --output-format npy to reduce storage."
+        )
+
+    def _save_array(self, path: Path, array: np.ndarray) -> None:
+        """Publish an NPY only after its write succeeds, keeping manifest headroom."""
+        free = self._free_bytes()
+        required = array.nbytes + 1024**2
+        if free is not None and free < required:
+            raise self._storage_error(
+                path,
+                f"insufficient space for {array.nbytes / 1024**2:.1f} MiB of array data "
+                "plus 1 MiB of working space",
+            )
+        temporary_path = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with temporary_path.open("wb") as stream:
+                np.save(stream, array, allow_pickle=False)
+            temporary_path.replace(path)
+        except OSError as exc:
+            # This is this write's temporary file, never a completed measurement.
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise self._storage_error(path, str(exc)) from exc
+
+    def _save_full_phase(
+        self, path: Path, phase: np.ndarray, record: dict[str, Any],
+    ) -> None:
+        """Write the large phase export after the camera record is checkpointed."""
+        try:
+            self._save_array(path, phase)
+        except StorageWriteError as exc:
+            record["full_pattern_save_error"] = str(exc)
+            try:
+                self._write_manifest()
+            except StorageWriteError:
+                # The earlier manifest already describes the saved camera data.
+                pass
+            raise
+        record["full_pattern_path"] = str(path.relative_to(self.output_dir))
+        self._write_manifest()
+
     def save_fringe_reference(
         self,
         frame: np.ndarray,
@@ -1028,10 +1094,9 @@ class OutputWriter:
         raw_path = reference_dir / f"fringe_only{suffix}.npy"
         preview_path = reference_dir / f"fringe_only{suffix}.png"
         phase_path = reference_dir / f"phase_slm{suffix}.npy"
-        np.save(raw_path, frame, allow_pickle=False)
+        self._save_array(raw_path, frame)
         preview, preview_low, preview_high = make_preview_u8(frame)
         self._image_class.fromarray(preview).save(preview_path)
-        np.save(phase_path, displayed_phase, allow_pickle=False)
         self.fringe_reference = {
             "pattern_type": "fringe_only",
             "reference_index": reference_number,
@@ -1041,7 +1106,7 @@ class OutputWriter:
             "preview_path": str(preview_path.relative_to(self.output_dir)),
             "preview_scale_1st_percentile": preview_low,
             "preview_scale_99th_percentile": preview_high,
-            "full_pattern_path": str(phase_path.relative_to(self.output_dir)),
+            "full_pattern_path": None,
             "display_time_ns": display_time_ns,
             "capture_time_ns": capture_time_ns,
             "frame_dtype": str(frame.dtype),
@@ -1053,6 +1118,7 @@ class OutputWriter:
         }
         self.fringe_references.append(self.fringe_reference)
         self._write_manifest()
+        self._save_full_phase(phase_path, displayed_phase, self.fringe_reference)
         return preview_path
 
     def save_fringe_feedback(
@@ -1089,15 +1155,10 @@ class OutputWriter:
         raw_path = self.raw_dir / f"frame_{number:04d}.npy"
         preview_path = self.preview_dir / f"frame_{number:04d}.png"
         modulation_path = self.pattern_dir / f"phase_modulation_{number:04d}.npy"
-        np.save(raw_path, frame, allow_pickle=False)
+        self._save_array(raw_path, frame)
         preview, preview_low, preview_high = make_preview_u8(frame)
         self._image_class.fromarray(preview).save(preview_path)
-        np.save(modulation_path, modulation, allow_pickle=False)
-
-        full_pattern_path: Optional[Path] = None
-        if self.config.save_full_patterns:
-            full_pattern_path = self.pattern_dir / f"phase_slm_{number:04d}.npy"
-            np.save(full_pattern_path, displayed_phase, allow_pickle=False)
+        self._save_array(modulation_path, modulation)
 
         processed = None
         processed_path: Optional[Path] = None
@@ -1113,7 +1174,7 @@ class OutputWriter:
                 self.config.crop_center_y,
             )
             processed_path = self.processed_dir / f"frame_{number:04d}.npy"
-            np.save(processed_path, processed, allow_pickle=False)
+            self._save_array(processed_path, processed)
             processed_preview_path = self.preview_dir / f"processed_{number:04d}.png"
             processed_preview, processed_preview_low, processed_preview_high = make_preview_u8(
                 processed
@@ -1150,9 +1211,7 @@ class OutputWriter:
             "processed_preview_scale_1st_percentile": processed_preview_low,
             "processed_preview_scale_99th_percentile": processed_preview_high,
             "modulation_path": str(modulation_path.relative_to(self.output_dir)),
-            "full_pattern_path": (
-                str(full_pattern_path.relative_to(self.output_dir)) if full_pattern_path else None
-            ),
+            "full_pattern_path": None,
             "zernike_coefficients_rad": coefficients.tolist(),
             "display_time_ns": display_time_ns,
             "capture_time_ns": capture_time_ns,
@@ -1162,6 +1221,9 @@ class OutputWriter:
         }
         self.records.append(record)
         self._write_manifest()
+        if self.config.save_full_patterns:
+            full_pattern_path = self.pattern_dir / f"phase_slm_{number:04d}.npy"
+            self._save_full_phase(full_pattern_path, displayed_phase, record)
 
     def _write_manifest(self) -> None:
         manifest = {
@@ -1175,8 +1237,11 @@ class OutputWriter:
         }
         temporary_path = self.output_dir / "manifest.json.tmp"
         final_path = self.output_dir / "manifest.json"
-        temporary_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-        os.replace(temporary_path, final_path)
+        try:
+            temporary_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            os.replace(temporary_path, final_path)
+        except OSError as exc:
+            raise self._storage_error(final_path, str(exc)) from exc
 
 
 def default_output_dir() -> Path:
@@ -1529,6 +1594,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         completed = run(config, output_dir)
     except (FileExistsError, RuntimeError, ValueError) as exc:
         parser.exit(2, f"error: {exc}\n")
+    except OSError as exc:
+        parser.exit(
+            2,
+            f"error: I/O failure during acquisition: {exc}. "
+            f"Output directory: {output_dir.resolve()}. "
+            "If this occurred while saving, check free space and write permissions.\n",
+        )
     if completed:
         print(f"Acquisition complete: {output_dir.resolve()}")
     else:
