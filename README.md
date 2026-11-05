@@ -1,5 +1,9 @@
 # HOLOEYE SLM + camera acquisition
 
+This repository covers data collection, SLM/camera calibration, and offline
+preprocessing. Generated data, server reconstruction tools, and transfer
+utilities are kept locally and excluded from version control.
+
 `acquire_slm_camera.py` reproduces the acquisition recipe from pages 3-5 of
 `sciadv.adg4671_sm.pdf`:
 
@@ -10,7 +14,8 @@
   Gaussian coefficients having a standard deviation of 5 radians.
 - A 256 x 256 modulation cropped to 144 x 256, nearest-neighbor upsampled to
   the SLM, added to the fringe, and wrapped to `2*pi`.
-- One full camera frame saved for every displayed pattern.
+- Ten full camera images averaged for every displayed pattern, with the
+  individual images also saved by default.
 - Grasshopper3 camera defaults of 100 ms exposure, gain 0 dB, gamma 1, and
   unpacked `Mono16`.
 - Paper-compatible downscaling by 3.57 followed by a centered 256 x 256 crop.
@@ -167,6 +172,7 @@ sequence, for example:
 ```powershell
 python acquire_slm_camera.py `
   --num-patterns 100 `
+  --frames-per-pattern 10 `
   --seed 1 `
   --exposure-ms 100 `
   --gain-db 0 `
@@ -178,9 +184,26 @@ python acquire_slm_camera.py `
   --output-dir data/sample_001
 ```
 
+Each phase pattern stays on the SLM while the camera captures
+`--frames-per-pattern` images (default **10**). The script settles once and
+discards the configured buffer frames once after displaying the pattern, then
+averages the retained images pixel by pixel. Averaging happens before scaling
+or cropping. The mean uses float64 accumulation and is saved as float32 camera
+counts, retaining fractional counts and avoiding integer overflow. It remains
+on the same intensity scale as one exposure. `--exposure-ms` is the exposure
+of each individual image.
+
+By default, both the average and all contributing camera images are saved.
+Use `--no-save-burst-frames` to keep only the averages and per-image metadata.
+Use `--frames-per-pattern 1` for the earlier single-image behavior; in that
+case the original integer camera image is retained without a duplicate burst.
+The separate calibration utility continues to use its own `--repeats` setting.
+
 The paper's 3.57 magnification is specific to its optical train. Perform the
-aperture/fringe-shift calibration described on pages 4-5 for your setup and
-pass the measured value as `--magnification`. Likewise, choose an exposure in
+aperture/fringe-shift calibration described on pages 4-5 for your setup. A
+scalar `--magnification` applies only to aligned axes with equal sampling;
+use the offline matrix option below for the measured 850 nm configuration.
+Likewise, choose an exposure in
 the paper's 90-120 ms range only after checking that your sample is not
 saturating. Set `--wavelength-nm` to your actual laser wavelength because
 HOLOEYE uses it for phase modulation; do not retain 532 nm if your laser is
@@ -190,14 +213,16 @@ For the current 1920 x 1200 setup, the commands in `RUN_COMMANDS.txt` use
 horizontal fringe lines and retain both zero and first orders in the same
 camera frame. Use `--capture-fringe-first --no-neuws-processing` to capture
 the pure steering fringe first, then add each random phase pattern to that
-same fringe and capture another full frame. The SLM and camera stay open
+same fringe and capture another averaged measurement. The SLM and camera stay open
 throughout the sequence. Each display update uses `--settle-ms` and
 `--discard-frames`, including the initial fringe reference. Ensure the camera
 ROI is set to the full sensor and both orders lie within its field of view.
 
-The fringe reference is extra: `--num-patterns 3 --capture-fringe-first` saves
-four frames total before any steering retries (one fringe reference and three
-random-plus-fringe frames). Each adjustment or recapture adds another reference.
+The fringe reference uses the same averaging count. With the default of 10,
+`--num-patterns 3 --capture-fringe-first` saves four averaged measurements
+from 40 retained camera images before any steering retries (one fringe
+reference and three random-plus-fringe measurements). Each adjustment or
+recapture adds another averaged reference and its individual images.
 The random pattern seed and numbering are unchanged by the initial reference.
 The full reference is saved as `reference/fringe_only.npy` plus a PNG preview;
 the following frames use the usual `raw/` and `previews/` directories.
@@ -221,7 +246,8 @@ At this prompt you can adjust the steering and capture another preview:
 - `N`: stop and close the devices, retaining all captured references.
 
 Each adjustment applies the fringe, waits for settling, discards buffered frames,
-saves a new full-frame NPY/PNG, and opens that preview for another decision.
+captures the averaging burst, saves a new mean NPY/PNG and individual images,
+and opens that preview for another decision.
 The printed sampled period accounts for equivalent ramps on the pixel grid;
 its sign describes ramp direction. Confirm the actual steering in the camera
 image. The initial slope still defaults to `4*pi/3`; to choose initial spacing
@@ -240,11 +266,13 @@ used alone.
 
 To select only the first order later, inspect the full-frame PNG and supply
 its raw-camera `(x, y)` position with `--crop-center-x` and `--crop-center-y`,
-omitting `--no-neuws-processing`. Full raw frames are still retained.
+omitting `--no-neuws-processing`. Full-frame averages and individual raw images
+are still retained with the default settings.
 
-The current run commands use `--output-format npy` and omit
-`--save-full-patterns` to reduce disk use. Camera NPY/PNG measurements, small
-phase-modulation arrays, coefficients, and steering settings are retained.
+The current run commands use `--frames-per-pattern 10 --save-burst-frames`,
+`--output-format npy`, and omit `--save-full-patterns`. Averaged camera NPY/PNG
+measurements, individual raw images, small phase-modulation arrays,
+coefficients, and steering settings are retained.
 The full phase array for each fringe-only reference is also retained.
 
 For a color Grasshopper3, select an unpacked 16-bit Bayer format supported by
@@ -328,6 +356,68 @@ Add `--export-mat` to also write cropped `imsdata` / modulation `proj_sim` MAT
 pairs. Crops are not automatically resampled to the paper's 256 x 256 size.
 All offline commands are also included as single lines in `RUN_COMMANDS.txt`.
 
+### Current 850 nm export: scale and crop in camera orientation
+
+Use the previously measured scale magnitudes, assigned to their dominant
+camera directions: 6.810272393954523 camera pixels horizontally and
+7.595985908414755 vertically per output pixel. The calibration lists these
+in SLM-axis order (x=7.595985908414755, y=6.810272393954523); its matrix shows
+that SLM x shifts mostly along camera y, and SLM y mostly along camera x.
+Assigning these scale factors to camera axes does not transpose the images.
+
+```powershell
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --preserve-camera-orientation --downsample-xy 6.810272393954523 7.595985908414755 --crop-size 128 --crop-center 658.9435440231936 752.8110040373784 --export-mat --output-dir processed\measurement_850nm_scaled_cropped_001
+```
+
+This bilinearly scales the full camera frame, then takes a fixed 128 x 128
+crop around the recorded first-order center. No rotation, reflection, or
+transpose is applied. The selected 900 x 1100 camera region supports about
+132 x 145 pixels at these scales; a 128-square crop fits entirely within it.
+A fully observed 256-square crop does not fit at the measured scale. Scaled
+frame dimensions are rounded to integer sizes; the requested factors and the
+resulting effective factors are both recorded under `scale_and_crop` in the
+manifest. `--downsample-factor S` also supports a single common factor.
+
+All measurements and the reference use the same transform. The processed raw
+reference counts are `reference_processed.npy`, and the original full reference
+is `reference/fringe_only.npy`. Camera count units are retained, with bilinear
+values rounded to uint16; no intensity normalization is applied. The original
+144 x 256 SLM phase arrays retain their orientation and values. All 100 pairs
+and their source identities/timestamps are retained. Downstream reconstruction
+must account for the 128-square camera crop and the measured camera-to-SLM
+mapping explicitly; the phase/pupil grid is not cropped.
+
+### Exact camera-crop diagnostic export
+
+To export exact unscaled camera crops from the acquisition:
+
+```powershell
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --preserve-camera-orientation --export-mat --output-dir processed\measurement_850nm_camera_axes_001
+```
+
+Without a downsampling option, `--preserve-camera-orientation` produces an
+exact crop and rejects `--calibration-file`. Each image is
+exactly `raw[200:1300, 200:1100]`: 1100 rows by 900 columns of original uint16
+counts, with no rotation, reflection, transpose, filtering, or resizing. The
+144 x 256 SLM modulation arrays are preserved in their original coordinates.
+All 100 original pairs are retained here, including the five flagged source
+indices 16, 41, 47, 66, and 91. Use source indices to select the same 95-frame
+subset when comparing against the earlier fits.
+
+New exports preserve the original acquisition manifest as `source_manifest.json`
+and the original reference arrays under `reference/`. The processed manifest
+also retains each frame's display, capture, and camera timestamps. Paths inside
+`source_manifest.json` refer to the original acquisition; the processed pair
+paths are in `manifest.json`. The source collection predates the later recaptures.
+
+These camera-coordinate crops require a forward model with explicit sampling
+into camera coordinates. They are not direct inputs to a model that assumes
+256-square measurements in SLM coordinates. The physical camera-to-SLM mapping
+must be represented before fitting; simply discarding the off-diagonal
+calibration terms or stretching the crop into a square does not establish
+correspondence.
+The model-axis workflow below documents the earlier, reoriented export.
+
 ## 7. Measure SLM/camera Fourier sampling
 
 `calibrate_slm_camera.py` implements the supplement's aperture/ramp calibration.
@@ -337,9 +427,11 @@ and wavelength fixed between calibration and acquisition. Run the hardware
 calibration command in `RUN_COMMANDS.txt` on the Windows acquisition PC.
 
 The command starts with the 20-pixel horizontal fringe used for the uploaded
-measurements. On the first camera image, draw a rectangle containing only the
-steered aperture, excluding the static zero order. Leave background margin
-around the spot (at least 24 pixels from its center), then press Enter.
+measurements. The current command reuses the 850 nm aperture ROI and enlarged
+120-pixel centroid window. To select a different region interactively, omit
+`--roi`: draw around only the steered aperture, excluding the static zero
+order, then press Enter. Leave background margin at least as large as the
+centroid radius around the spot.
 Ten ramp positions are captured: the carrier, signed offsets on both SLM axes,
 and a return to the carrier. Three raw frames are retained at each position.
 The script checks weak/saturated/edge detections and fits a robust affine map:
@@ -382,13 +474,74 @@ active rows. This model choice changes the normalized FFT sampling, while
 the measured raw optical matrix B is unchanged. The report therefore retains
 B instead of forcing the two axes into one assumed magnification number.
 It does not calibrate the SLM LUT, beam footprint, or direct image-plane
-registration, and does not automatically resize the existing image/phase pairs.
+registration. Apply it offline with the option described below.
 
 If a spot leaves the search window, reduce `--step-cycles-per-pixel` or adjust
 `--tracking-radius`, while keeping the static zero order outside the search.
 Use `--analyze-only` to refit saved captures without opening hardware, optionally
 with a corrected `--roi`. `--skip-review` saves an unapproved result for later
 inspection. Each run/refit needs a new output directory.
+
+## 8. Earlier model-axis export (changes image orientation)
+
+This workflow does not preserve camera orientation. Supply an approved hardware calibration to resample the selected first order
+with its full matrix, including rotation/reflection and unequal axis scales:
+
+```powershell
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --calibration-file data\measurement_850nm_001\calibration_850nm.json --include-full-phase --export-mat --output-dir processed\measurement_850nm_originals_calibrated_001
+```
+
+Choose a new output directory on subsequent runs. This example selects the
+left steered order in the uploaded 850 nm collection. Inspect `roi_preview.png`
+and `reference_calibrated.png` to check the selection. The origin is the
+calibration's predicted aperture position at the acquisition carrier; it stays
+fixed across all patterns. `--camera-center X Y` can explicitly override that
+origin. This is a choice of model-image origin, not an object-registration
+measurement. The processor rejects incompatible wavelength, SLM/camera shapes,
+carrier, phase-grid interpretation, or unapproved/synthetic calibrations.
+
+The output retains `image_camera_crop` as exact uint16 camera values and the
+original `phase_modulation_rad`. With calibration enabled, `image` is a
+256 x 256 float32 array in the model's FFT axes. A Gaussian prefilter and
+bilinear interpolation reduce aliasing; no background subtraction, per-frame
+intensity normalization, or flux multiplier is applied. Filtering/interpolation
+change individual values, so the unchanged crop remains available.
+
+**Use `image_valid_mask` when fitting or comparing the calibrated image.**
+Samples outside the selected camera ROI, sensor support, or filtering margin
+are NaN, not observed zero intensity. Transparent PNG areas are missing data.
+For this collection and crop, 17,900 of 65,536 model pixels (27.3%) are valid;
+the central `[68:188, 68:188]` 120 x 120 image region is fully supported. A
+complete observed 256 x 256 image does not fit at the measured sampling. Do not
+stretch a smaller crop to 256 x 256, which would change the calibrated spacing.
+When cropping the model image further, retain the 256-grid pupil/phase and
+model the image crop explicitly.
+
+Each pair also includes `phase_model_rad` and `pupil_mask`: the original
+144 x 256 phase is embedded unchanged in rows 56:200 of a 256-square pupil,
+with zero amplitude outside those rows. The carrier is absorbed into the camera
+origin; it is not added to this modulation-only model phase. The optional
+`phase_slm_rad` still represents the full displayed random-plus-carrier mask.
+The pupil mask describes the generator rectangle, not a measured illumination footprint.
+The camera ROI never crops or rotates the phase array. Calibrated MAT exports
+contain `imsdata` plus `valid_mask`, and 256-square `proj_sim` plus `pupil_mask`.
+
+```python
+with np.load("processed/measurement_850nm_originals_calibrated_001/pairs/frame_0001.npz", allow_pickle=False) as pair:
+    image = pair["image"]
+    valid = pair["image_valid_mask"]
+    phase = pair["phase_model_rad"]
+    pupil = pair["pupil_mask"]
+    # Compare a model prediction only on valid pixels: prediction[valid].
+```
+
+Source pattern indices, selected raw paths, source quality flags, the source
+manifest hash, and the calibration hash/snapshot are recorded. Selected
+recaptures are read from the manifest rather than inferred from filenames.
+The supplied measurement ZIP predates the recaptures described in the session
+notes: patterns 16, 41, 66, and 91 remain background-only, and 47 has weak
+contrast. All are retained and flagged. The updated manifest and replacement
+captures are needed to reproduce the preferred post-recapture collection.
 
 ## Output
 
@@ -398,6 +551,13 @@ Each run contains:
 sample_001/
   manifest.json
   raw/frame_0001.npy
+  raw_bursts/frame_0001/sample_01.npy
+  raw_bursts/frame_0001/sample_02.npy
+  ...
+  raw_bursts/frame_0001/sample_10.npy
+  reference/fringe_only.npy
+  raw_bursts/reference_0001/sample_01.npy
+  ...
   previews/frame_0001.png
   previews/processed_0001.png
   processed/frame_0001.npy
@@ -406,8 +566,12 @@ sample_001/
   neuws_mat/SLM_sim1.mat
 ```
 
-The full sensor frame is always retained unchanged in `raw/`. `previews/`
-contains viewable 8-bit PNGs scaled between each frame's 1st and 99th
+`raw/frame_NNNN.npy` contains the full-sensor float32 average when averaging
+is enabled. The contributing camera images retain their original dtype and
+values under `raw_bursts/frame_NNNN/`. References use `reference/fringe_only.npy`
+(with numbered suffixes for retries) and `raw_bursts/reference_NNNN/`.
+With `--frames-per-pattern 1`, `raw/` contains the unchanged camera image.
+`previews/` contains viewable 8-bit PNGs of the averages scaled between their 1st and 99th
 percentiles; these previews are for inspection rather than quantitative use.
 If those limits coincide, the full intensity range is used instead.
 `processed/` contains the 3.57x downscaled 256 x 256 measurement. By default
@@ -419,11 +583,22 @@ The MAT files use the variable and filename conventions expected by the public N
 `imsdata` in `SLM_rawN.mat` and `proj_sim` in `SLM_simN.mat`.
 
 `manifest.json` records all settings, Zernike coefficients, file paths, camera
-frame identifiers, and display/capture timestamps. It is rewritten after each
-successful frame, so completed data remains described if acquisition stops.
-Camera measurements are recorded in the manifest before writing a large full
-SLM phase export. If that export fails, its `full_pattern_path` remains null
-and a `full_pattern_save_error` is recorded when disk space permits.
+frame identifiers, and display/capture timestamps. Each measurement's
+`averaging` record contains the count, source/output dtypes, individual frame
+IDs, camera timestamps, host capture times, and raw-image paths. Top-level
+`frame_id` and `camera_timestamp_ns` identify the last contributing image;
+`capture_start_time_ns` and `capture_end_time_ns` describe the burst interval.
+`frames_completed` counts completed phase-pattern measurements, not exposures.
+Preprocessing consumes the average and preserves this provenance in
+`source_averaging` and `source_manifest.json`; individual-image paths refer to
+the original acquisition directory.
+
+A failed capture stops the run without publishing a partial average. After a
+complete burst, the average is checkpointed before individual images and the
+optional full SLM phase are written. Raw-image save progress is recorded in
+the manifest; a storage failure leaves the average available and records
+`raw_frames_save_error` when possible. A failed full-phase export leaves
+`full_pattern_path` null and records `full_pattern_save_error` when possible.
 When `--capture-fringe-first` is used, the `fringe_reference` entry records the
 initial reference files and timestamps. `frames_completed` counts only the
 subsequent frames requested by `--num-patterns`.
@@ -440,6 +615,10 @@ Useful options:
   period in SLM pixels instead of `--fringe-slope-rad-per-pixel`.
 - `--no-neuws-processing`: retain raw frames but skip scaling/cropping.
 - `--output-format npy`: avoid the SciPy MAT-file dependency.
+- `--frames-per-pattern 10`: average ten camera images for each pattern and
+  each fringe reference (default); use 1 for a single unchanged camera image.
+- `--save-burst-frames`: retain individual camera images as well as averages
+  (default). `--no-save-burst-frames` retains averages and metadata only.
 - `--discard-frames N`: discard buffered PySpin frames after each SLM update.
 - `--slm-preselect STRING`: select an SLM in HEDS 4.x multi-SLM setups.
 - `--heds-examples-dir PATH`: locate the installed SDK's `examples/HEDS` API.
@@ -467,6 +646,12 @@ could not be written. Check available space on the acquisition PC:
 ```powershell
 Get-PSDrive -PSProvider FileSystem
 ```
+
+At 2000 x 1500 camera pixels, ten uint16 images use about 60 MB and their
+float32 average uses another 12 MB per pattern. A 100-pattern run therefore
+needs about **7.2 GB** for these arrays, plus references, previews, processing,
+and optional MAT/phase exports. `--no-save-burst-frames` reduces this to about
+1.2 GB of averages for 100 patterns.
 
 At 1920 x 1200, each full float32 phase array contains 2,304,000 values and
 needs 9,216,000 bytes (about 9.2 MB), plus the NPY header. One hundred full

@@ -20,9 +20,11 @@ from acquire_slm_camera import (
     NeuWSPatternGenerator,
     OutputWriter,
     PlayerOneCamera,
+    PySpinCamera,
     StorageWriteError,
     build_parser,
     config_from_args,
+    capture_average,
     main,
     noll_indices,
     open_fringe_preview,
@@ -68,6 +70,7 @@ def test_config(seed=7):
         save_full_patterns=False,
         require_16_bit=True,
         dry_run=True,
+        frames_per_pattern=1,
     )
 
 
@@ -208,6 +211,8 @@ class PatternTests(unittest.TestCase):
         self.assertIsNone(config.crop_center_y)
         self.assertEqual(config.discard_frames, 1)
         self.assertEqual(config.pixel_format, "auto")
+        self.assertEqual(config.frames_per_pattern, 10)
+        self.assertTrue(config.save_burst_frames)
 
     def test_playerone_default_discards_no_snap_frames(self):
         parser = build_parser()
@@ -247,6 +252,150 @@ class PatternTests(unittest.TestCase):
         self.assertAlmostEqual(high, 98.01)
         self.assertEqual(int(preview[0, 0]), 0)
         self.assertEqual(int(preview[-1, -1]), 255)
+
+
+class AveragingTests(unittest.TestCase):
+    def test_default_ten_frame_mean_keeps_fractional_counts_raw_frames_and_phase_identity(self):
+        config = config_from_args(build_parser().parse_args([
+            "--dry-run", "--capture-fringe-first", "--num-patterns", "2",
+            "--settle-ms", "250", "--no-neuws-processing", "--output-format", "mat",
+        ]))
+        config = replace(config, slm_height=108, slm_width=192)
+        values = list(range(65526, 65536)) + list(range(100, 110)) + list(range(200, 210))
+        frames = [np.full((12, 16), value, dtype=np.uint16) for value in values]
+        slm, camera, events = Mock(), Mock(), Mock()
+        camera.capture.side_effect = [(f, {"frame_id": i + 1, "camera_timestamp_ns": 1000 + i})
+                                      for i, f in enumerate(frames)]
+        events.attach_mock(slm.show, "display")
+        events.attach_mock(camera.capture, "capture")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            with (patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                  patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                  patch("acquire_slm_camera.time.sleep") as settle):
+                events.attach_mock(settle, "settle")
+                self.assertTrue(run(config, root))
+            self.assertEqual([call[0] for call in events.mock_calls],
+                             (["display", "settle"] + ["capture"] * 10) * 3)
+            manifest = json.loads((root / "manifest.json").read_text())
+            self.assertEqual(manifest["frames_completed"], 2)
+            records = [manifest["fringe_reference"]] + manifest["frames"]
+            for group, record in enumerate(records):
+                mean = np.load(root / record["raw_path"])
+                self.assertEqual(mean.dtype, np.float32)
+                np.testing.assert_array_equal(mean, np.mean(frames[group*10:(group+1)*10], axis=0))
+                self.assertEqual(record["measurement_kind"], "frame_average")
+                self.assertEqual(record["frame_id"], (group + 1) * 10)
+                self.assertEqual(record["averaging"]["frame_count"], 10)
+                self.assertTrue(record["averaging"]["raw_frames_saved"])
+                self.assertLessEqual(record["capture_start_time_ns"], record["capture_end_time_ns"])
+                self.assertEqual(record["capture_time_ns"], record["capture_end_time_ns"])
+                for sample, info in enumerate(record["averaging"]["frames"]):
+                    np.testing.assert_array_equal(np.load(root / info["raw_path"]), frames[group*10+sample])
+                    self.assertEqual(info["frame_id"], group*10+sample+1)
+                    self.assertEqual(info["camera_timestamp_ns"], 1000+group*10+sample)
+                    self.assertIsInstance(info["capture_time_ns"], int)
+                    call = camera.capture.call_args_list[group*10+sample]
+                    self.assertIs(call.args[0], slm.show.call_args_list[group].args[0])
+                    self.assertEqual(call.kwargs, {} if sample == 0 else {"discard_frames": 0})
+            from scipy.io import loadmat
+            np.testing.assert_array_equal(loadmat(root / "neuws_mat/SLM_raw1.mat")["imsdata"],
+                                          np.full((12, 16), 104.5, dtype=np.float32))
+            camera.close.assert_called_once()
+            slm.close.assert_called_once()
+
+    def test_buffer_discard_happens_once_for_pyspin_burst(self):
+        camera = PySpinCamera(replace(test_config(), discard_frames=2))
+        camera._get_image = Mock(side_effect=[
+            (np.full((2, 2), i, dtype=np.uint16), {"frame_id": i}) for i in range(12)
+        ])
+        mean, metadata, frames = capture_average(camera, None, 10)
+        self.assertEqual(camera._get_image.call_count, 12)
+        np.testing.assert_array_equal(mean, np.full((2, 2), 6.5))
+        self.assertEqual([s["frame_id"] for s in metadata["averaging"]["frames"]], list(range(2, 12)))
+        self.assertEqual(frames, [])
+
+    def test_buffer_discard_happens_once_for_playerone_burst(self):
+        camera = PlayerOneCamera(replace(test_config(), discard_frames=2))
+        camera._capture_once = Mock(side_effect=[
+            (np.full((2, 2), i, dtype=np.uint16), {"frame_id": i}) for i in range(12)
+        ])
+        mean, _, _ = capture_average(camera, None, 10)
+        self.assertEqual(camera._capture_once.call_count, 12)
+        np.testing.assert_array_equal(mean, np.full((2, 2), 6.5))
+
+    def test_single_frame_compatibility_and_invalid_counts(self):
+        camera = Mock()
+        camera.capture.return_value = (np.array([[65535]], dtype=np.uint16), {"frame_id": 1})
+        frame, metadata, frames = capture_average(camera, None, 1, keep_frames=True)
+        self.assertEqual(frame.dtype, np.uint16)
+        self.assertEqual(int(frame[0, 0]), 65535)
+        self.assertEqual(metadata["measurement_kind"], "single_frame")
+        self.assertEqual(frames, [])
+        for count in (0, -1):
+            with self.subTest(count=count), patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args(["--frames-per-pattern", str(count)])
+        config = config_from_args(build_parser().parse_args(["--no-save-burst-frames"]))
+        self.assertFalse(config.save_burst_frames)
+
+    def test_invalid_or_duplicate_frames_reject_the_burst(self):
+        first = (np.ones((2, 2), dtype=np.uint16), {"frame_id": 1})
+        for other in [(np.ones((3, 2), dtype=np.uint16), {"frame_id": 2}),
+                      (np.ones((2, 2), dtype=np.uint8), {"frame_id": 2}),
+                      (np.ones((2, 2), dtype=np.uint16), {"frame_id": 1}),
+                      (np.full((2, 2), np.nan), {"frame_id": 2})]:
+            camera = Mock()
+            camera.capture.side_effect = [first, other]
+            with self.subTest(other=other), self.assertRaises(RuntimeError):
+                capture_average(camera, None, 2)
+
+    def test_mid_burst_failure_keeps_reference_and_does_not_publish_partial_average(self):
+        config = replace(test_config(), num_patterns=1, capture_fringe_first=True,
+                         neuws_processing=False, frames_per_pattern=3)
+        camera, slm = Mock(), Mock()
+        camera.capture.side_effect = [
+            (np.full((2, 2), i, dtype=np.uint16), {"frame_id": i}) for i in range(4)
+        ] + [RuntimeError("camera timeout")]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            with (patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                  patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                  self.assertRaisesRegex(RuntimeError, "camera timeout")):
+                run(config, root)
+            manifest = json.loads((root / "manifest.json").read_text())
+            self.assertEqual(manifest["frames_completed"], 0)
+            self.assertTrue(manifest["fringe_reference"]["averaging"]["raw_frames_saved"])
+            self.assertFalse(list((root / "raw").glob("*.npy")))
+            self.assertEqual(slm.show.call_count, 2)
+            camera.close.assert_called_once()
+            slm.close.assert_called_once()
+
+    def test_burst_storage_failure_preserves_average_and_records_saved_samples(self):
+        config = replace(test_config(), num_patterns=1, neuws_processing=False, frames_per_pattern=3)
+        camera, slm = Mock(), Mock()
+        camera.capture.side_effect = [
+            (np.full((2, 2), i, dtype=np.uint16), {"frame_id": i}) for i in range(3)
+        ]
+        save = OutputWriter._save_array
+        def fail_second_sample(writer, path, array):
+            if path.name == "sample_02.npy":
+                raise StorageWriteError("disk full")
+            return save(writer, path, array)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "run"
+            with (patch("acquire_slm_camera.SimulatedSLM", return_value=slm),
+                  patch("acquire_slm_camera.SimulatedCamera", return_value=camera),
+                  patch.object(OutputWriter, "_save_array", fail_second_sample),
+                  self.assertRaisesRegex(StorageWriteError, "disk full")):
+                run(config, root)
+            record = json.loads((root / "manifest.json").read_text())["frames"][0]
+            np.testing.assert_array_equal(np.load(root / record["raw_path"]), np.ones((2, 2)))
+            averaging = record["averaging"]
+            self.assertFalse(averaging["raw_frames_saved"])
+            self.assertEqual(averaging["raw_frames_save_error"], "disk full")
+            self.assertTrue((root / averaging["frames"][0]["raw_path"]).is_file())
+            self.assertIsNone(averaging["frames"][1]["raw_path"])
 
 
 class StorageTests(unittest.TestCase):
@@ -364,6 +513,7 @@ class AcquisitionSequenceTests(unittest.TestCase):
             parser.parse_args(
                 [
                     "--dry-run", "--capture-fringe-first", "--num-patterns", "2",
+                    "--frames-per-pattern", "1",
                     "--fringe-orientation", "horizontal", "--settle-ms", "300",
                     "--no-neuws-processing", "--output-format", "npy",
                     "--save-full-patterns",

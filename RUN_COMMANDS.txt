@@ -1,15 +1,21 @@
 # Windows PowerShell commands. Run one command at a time from this project directory.
 # Replace the HEDS path, camera serial, and wavelength with the values for your setup.
+# Session notes confirm an 850 nm laser and camera serial 20100892. Hardware examples below explicitly use 850 nm and 10 ms exposure. Keep the matching optical configuration.
+# On the acquisition PC, activate the environment containing PySpin before running these commands.
+conda activate slm-ctl
 # "horizontal" means horizontal fringe lines; the phase ramp varies top-to-bottom along y.
 # If you instead need horizontal beam steering along x, use vertical fringe lines.
 # Current workflow: capture the fringe alone first, then add random phase to the same fringe.
 # Save the full camera field so zero and first orders are included when both are on the sensor.
-# --num-patterns counts random-plus-fringe frames; --capture-fringe-first adds one reference frame.
+# --num-patterns counts random-plus-fringe patterns; --capture-fringe-first adds one averaged reference.
+# For each pattern/reference, hold the SLM fixed, settle/discard once, and average 10 images. Save all individual raw images too.
+# At 2000x1500 uint16, 100 patterns need about 7.2 GB for raw images plus float32 means, before references/previews.
+# --frames-per-pattern 1 restores single-image capture; --no-save-burst-frames saves only means and per-image metadata.
 # --confirm-fringe-preview opens the first camera image and holds the fringe until you answer Y or N in the terminal.
 # At the preview prompt: P 20 sets a 20-pixel fringe period; P -20 sets the opposite slope; R reverses the current ramp; H/V selects horizontal/vertical fringe lines; C captures a fresh preview.
 # Each adjustment captures another full-frame reference. Y uses the accepted fringe for all random phase patterns; N stops.
 # Optional initial spacing: add --fringe-period-pixels 20 to an acquisition command. The default slope remains 4*pi/3 rad/pixel.
-# The commands below save camera NPY/PNG data without duplicate MAT files or optional full-size random SLM phase arrays.
+# The commands below save float32 mean NPY/PNG data and individual raw NPY images, without duplicate MAT files or optional full-size random SLM phase arrays.
 # Add --save-full-patterns only if needed: a 1920x1200 float32 phase adds about 9.2 MB per pattern. Fringe-reference phase arrays are still retained.
 
 # Check available space on the Windows acquisition PC before a run.
@@ -19,25 +25,25 @@ Get-PSDrive -PSProvider FileSystem
 python -m pip install -r requirements.txt
 
 # Simulate the full sequence with preview feedback: answer Y for 3 more simulated frames, or N to stop. Simulated frames test software flow, not optical order separation.
-python acquire_slm_camera.py --dry-run --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --output-format npy
+python acquire_slm_camera.py --frames-per-pattern 10 --save-burst-frames --dry-run --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --output-format npy
 
 # Run the automated software tests without hardware.
 python -m unittest -v test_acquire_slm_camera.py test_process_measurements.py test_calibrate_slm_camera.py
 
 # Capture one real camera frame without opening the SLM.
-python camera_smoke_test.py --camera-serial YOUR_CAMERA_SERIAL --exposure-ms 100 --gain-db 0 --pixel-format Mono16
+python camera_smoke_test.py --camera-serial YOUR_CAMERA_SERIAL --exposure-ms 10 --gain-db 0 --pixel-format Mono16
 
 # Tell the current PowerShell session where the HOLOEYE SDK examples directory is located.
 $env:HEDS_EXAMPLES_DIR = "C:\Program Files\HOLOEYE Photonics\SLM Display SDK (Python) v4.2.1\examples"
 
 # Optional fringe-only check: capture both orders in one full frame with no random phase. Open data\find_steered_order\previews\frame_0001.png.
-python acquire_slm_camera.py --num-patterns 1 --coefficient-std-rad 0 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --no-neuws-processing --output-format npy --output-dir data\find_steered_order
+python acquire_slm_camera.py --frames-per-pattern 10 --save-burst-frames --num-patterns 1 --coefficient-std-rad 0 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 20 --settle-ms 1000 --discard-frames 2 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 850 --exposure-ms 10 --gain-db 0 --pixel-format Mono16 --no-neuws-processing --output-format npy --output-dir data\find_steered_order
 
-# Capture the fringe, adjust steering with P/R/H/V/C as needed, then answer Y to capture 3 random-plus-fringe frames, or N to stop. At least 4 saved frames after Y; every adjustment adds a reference. Each SLM update settles for 300 ms and discards 2 camera frames.
-python acquire_slm_camera.py --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-format npy --output-dir data\hardware_test_002
+# Capture the fringe, adjust steering with P/R/H/V/C as needed, then answer Y to capture 3 random-plus-fringe frames, or N to stop. Four averaged measurements from 40 retained camera images after Y; every adjustment adds a reference. Each SLM update settles for 1000 ms and discards 2 camera frames once before capturing 10 images.
+python acquire_slm_camera.py --frames-per-pattern 10 --save-burst-frames --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 20 --settle-ms 1000 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 850 --exposure-ms 10 --gain-db 0 --pixel-format Mono16 --output-format npy --output-dir data\hardware_test_003
 
-# Full run with the same steering controls and Y/N check: fringe references plus 100 random-plus-fringe measurements after Y. Use a new output directory each time.
-python acquire_slm_camera.py --capture-fringe-first --confirm-fringe-preview --num-patterns 100 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 532 --exposure-ms 100 --gain-db 0 --pixel-format Mono16 --output-format npy --output-dir data\measurement_001
+# Full run with the same steering controls and Y/N check: averaged fringe references plus 100 random-plus-fringe averages after Y (1000 retained pattern exposures). Use a new output directory each time.
+python acquire_slm_camera.py --frames-per-pattern 10 --save-burst-frames --capture-fringe-first --confirm-fringe-preview --num-patterns 100 --seed 1 --zernike-modes 15 --coefficient-std-rad 5 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 20 --settle-ms 1000 --discard-frames 2 --no-neuws-processing --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --wavelength-nm 850 --exposure-ms 10 --gain-db 0 --gamma 1 --pixel-format Mono16 --output-format npy --output-dir data\measurement_850nm_002
 
 # OFFLINE PROCESSING: draw a rectangle around the steered camera image, then press Enter. Saves crop/phase NPZ pairs and previews; no hardware is opened. Full SLM phase inclusion uses more disk space.
 python process_measurements.py datameasurement_aa --output-dir processed\measurement_aa_selected --include-full-phase
@@ -49,12 +55,25 @@ python process_measurements.py datameasurement_aa --roi 300 200 900 1100 --outpu
 python process_measurements.py datameasurement_aa --roi 300 200 900 1100 --exclude-indices 4 5 6 7 34 60 61 62 89 90 --output-dir processed\measurement_aa_steered_filtered --include-full-phase --export-mat
 
 # CALIBRATION: replace the object with a small aperture and remove the aberrator. Keep the optics, camera ROI/binning, and wavelength fixed. Start at 10 ms exposure; reduce it if the aperture is saturated. Allow roughly 400 MB of free space for a 2000x1500 camera.
-# First select the STEERED aperture image with some background margin, press Enter, and let the ramp scan finish. Inspect the marked positions and answer Y only if they track the same aperture.
+# The ROI/window settings reuse the successful 850 nm scan. Omit --roi to draw a different STEERED-aperture region; leave margin for the 120-pixel centroid radius. Inspect the final marked positions and answer Y only if they track the same aperture.
 # Use 144 pupil rows to interpret existing captures. The tool also records the raw optical mapping, so an aspect-matched 160-row model can be calculated later without assuming the paper's 3.57 factor.
-python calibrate_slm_camera.py --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 20 --settle-ms 1000 --discard-frames 2 --exposure-ms 10 --gain-db 0 --pixel-format Mono16 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --pupil-rows 144 --steps 2 --repeats 3 --output-dir data\calibration_001
+python calibrate_slm_camera.py --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 20 --wavelength-nm 850 --settle-ms 1000 --discard-frames 2 --exposure-ms 10 --gain-db 0 --pixel-format Mono16 --slm-preselect "index:0" --camera-serial YOUR_CAMERA_SERIAL --pupil-rows 144 --steps 2 --repeats 3 --roi 400 500 500 500 --centroid-radius 120 --tracking-radius 300 --output-dir data\calibration_850nm_002
 
 # Validate the calibration software using synthetic aperture images. This does NOT measure your optics or produce a usable hardware calibration.
 python calibrate_slm_camera.py --dry-run --pupil-rows 160 --steps 2 --repeats 3 --output-dir data\calibration_simulated_001
 
 # Refit saved calibration captures without opening hardware. Omit --roi to reuse the initial selection; supply --roi X Y WIDTH HEIGHT to correct the selected aperture.
-python calibrate_slm_camera.py --analyze-only data\calibration_001 --pupil-rows 144 --output-dir data\calibration_refit_001
+python calibrate_slm_camera.py --analyze-only data\calibration_850nm_001 --pupil-rows 144 --output-dir data\calibration_refit_001
+
+# CURRENT 850 NM EXPORT: scale then crop, keeping camera axes. Use the earlier measured magnitudes in camera x/y order. The fixed 128x128 crop fits within the selected first-order region; a fully observed 256x256 crop does not fit at this scale.
+# Retains all 100 pairs, unmodified phases, raw and processed reference counts, and timestamps. Downstream fitting must account for the 128x128 camera crop and measured camera-to-SLM mapping.
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --preserve-camera-orientation --downsample-xy 6.810272393954523 7.595985908414755 --crop-size 128 --crop-center 658.9435440231936 752.8110040373784 --export-mat --output-dir processed\measurement_850nm_scaled_cropped_001
+
+# EXACT UNSCALED CAMERA-CROP DIAGNOSTIC: exact 1100x900 camera crops with original axes/counts and 144x256 SLM phase. Retains all 100 original pairs, raw fringe references, and acquisition timestamps. The explicit flag rejects calibrated reorientation.
+# Downstream fitting must account for these camera coordinates and crop dimensions. Choose a new output name when repeating.
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --preserve-camera-orientation --export-mat --output-dir processed\measurement_850nm_camera_axes_001
+
+# EARLIER CALIBRATED EXPORT (changes orientation; does not meet the current camera-orientation requirement): no hardware. Retains raw crops and phase pairs; uses the full 850 nm matrix for orientation/sampling. PNG transparency and image_valid_mask identify missing model pixels; do not treat them as measured zeros.
+# The uploaded ZIP contains the ORIGINAL pre-recapture collection. All 100 pairs are retained; indices 16, 41, 47, 66, 91 remain flagged. Copy the final manifest AND its recaptures directory to process the preferred replacement frames.
+# The command below was run locally. Select a new output directory if repeating it.
+python process_measurements.py data\measurement_850nm_001 --roi 200 200 900 1100 --calibration-file data\measurement_850nm_001\calibration_850nm.json --include-full-phase --export-mat --output-dir processed\measurement_850nm_originals_calibrated_001

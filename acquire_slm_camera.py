@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Display NeuWS-style phase patterns and acquire one camera frame per pattern.
+"""Display NeuWS-style phase patterns and average camera frames per pattern.
 
 The pattern recipe follows pages 4-5 of sciadv.adg4671_sm.pdf. Hardware mode
 defaults to the HOLOEYE SLM Display SDK and FLIR/Point Grey Spinnaker (PySpin).
@@ -69,6 +69,8 @@ class ExperimentConfig:
     dry_run: bool
     capture_fringe_first: bool = False
     confirm_fringe_preview: bool = False
+    frames_per_pattern: int = 10
+    save_burst_frames: bool = True
 
 
 def noll_indices(count: int) -> list[tuple[int, int]]:
@@ -167,17 +169,20 @@ def resize_bilinear(array: np.ndarray, output_shape: tuple[int, int]) -> np.ndar
 
 def process_neuws_frame(
     frame: np.ndarray,
-    magnification: float,
+    magnification: float | tuple[float, float],
     crop_size: int,
     crop_center_x: Optional[float] = None,
     crop_center_y: Optional[float] = None,
 ) -> np.ndarray:
-    """Downscale, then crop around a selected location in raw-camera coordinates."""
-    if magnification <= 0:
-        raise ValueError("Magnification must be positive")
+    """Scale in camera axes, then crop; a pair of divisors is ordered (x, y)."""
+    factors = np.asarray(magnification, dtype=float)
+    if factors.ndim == 0:
+        factors = np.repeat(factors, 2)
+    if factors.shape != (2,) or not np.isfinite(factors).all() or np.any(factors <= 0):
+        raise ValueError("Magnification must be a positive finite scalar or (x, y) pair")
     scaled_shape = (
-        max(1, int(round(frame.shape[0] / magnification))),
-        max(1, int(round(frame.shape[1] / magnification))),
+        max(1, int(round(frame.shape[0] / factors[1]))),
+        max(1, int(round(frame.shape[1] / factors[0]))),
     )
     scaled = resize_bilinear(frame, scaled_shape)
     if min(scaled.shape) < crop_size:
@@ -202,7 +207,7 @@ def process_neuws_frame(
         requested_y = crop_center_y if crop_center_y is not None else frame.shape[0] / 2.0
         raise ValueError(
             f"Crop centered at raw camera coordinate ({requested_x:.1f}, {requested_y:.1f}) "
-            f"falls outside the frame after {magnification:g}x downscaling"
+            f"falls outside the frame after ({factors[0]:g}, {factors[1]:g}) downscaling in camera x/y"
         )
     return scaled[
         row_start:row_end,
@@ -551,7 +556,10 @@ class SimulatedCamera:
     def open(self) -> None:
         print("[dry-run] Simulated 1384x1036 16-bit camera opened")
 
-    def capture(self, phase_rad: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def capture(
+        self, phase_rad: Optional[np.ndarray] = None, *, discard_frames: Optional[int] = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        del discard_frames  # The simulator has no buffered exposures.
         self._frame_id += 1
         if phase_rad is None:
             phase_small = np.zeros((1036, 1384), dtype=np.float32)
@@ -785,10 +793,12 @@ class PlayerOneCamera:
     def capture(
         self,
         phase_rad: Optional[np.ndarray] = None,
+        *, discard_frames: Optional[int] = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         del phase_rad
         result: tuple[np.ndarray, dict[str, Any]]
-        for _ in range(self.config.discard_frames + 1):
+        discarded = self.config.discard_frames if discard_frames is None else discard_frames
+        for _ in range(discarded + 1):
             result = self._capture_once()
         frame, metadata = result
         if self.config.require_16_bit and frame.dtype.itemsize != 2:
@@ -944,9 +954,12 @@ class PySpinCamera:
         finally:
             image.Release()
 
-    def capture(self, phase_rad: Optional[np.ndarray] = None) -> tuple[np.ndarray, dict[str, Any]]:
+    def capture(
+        self, phase_rad: Optional[np.ndarray] = None, *, discard_frames: Optional[int] = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
         del phase_rad
-        for _ in range(self.config.discard_frames):
+        discarded = self.config.discard_frames if discard_frames is None else discard_frames
+        for _ in range(discarded):
             self._get_image()
         frame, metadata = self._get_image()
         if self.config.require_16_bit and frame.dtype.itemsize != 2:
@@ -972,6 +985,58 @@ class PySpinCamera:
             if self.system is not None:
                 self.system.ReleaseInstance()
                 self.system = None
+
+
+def capture_average(camera, phase, count, *, keep_frames=False):
+    """Capture a fixed-pattern burst; discard buffered frames only on its first read.
+
+    Accumulate in float64 to avoid integer overflow, then retain fractional
+    camera counts in a float32 mean. A single-frame capture retains its dtype.
+    No partial burst is returned as a completed measurement.
+    """
+    if not isinstance(count, int) or count < 1:
+        raise ValueError("frames_per_pattern must be a positive integer")
+    total, shape, dtype = None, None, None
+    frames, samples, seen_ids = [], [], set()
+    started = time.time_ns()
+    for index in range(count):
+        if index == 0:
+            frame, metadata = camera.capture(phase)
+        else:
+            frame, metadata = camera.capture(phase, discard_frames=0)
+        captured = time.time_ns()
+        frame = np.asarray(frame)
+        if frame.ndim != 2 or frame.dtype.kind not in "uif" or not np.isfinite(frame).all():
+            raise RuntimeError("Expected a finite, numeric 2-D camera frame in averaging burst")
+        if index == 0:
+            shape, dtype = frame.shape, frame.dtype
+            total = np.zeros(shape, dtype=np.float64)
+        elif frame.shape != shape or frame.dtype != dtype:
+            raise RuntimeError("Camera frame shape or dtype changed within averaging burst")
+        frame_id = metadata.get("frame_id")
+        if frame_id is not None:
+            if frame_id in seen_ids:
+                raise RuntimeError(f"Duplicate camera frame ID {frame_id} in averaging burst")
+            seen_ids.add(frame_id)
+        total += frame
+        if keep_frames and count > 1:
+            frames.append(frame.copy())
+        samples.append({**metadata, "sample_index": index + 1,
+                        "capture_time_ns": captured, "raw_path": None})
+    result = frame.copy() if count == 1 else (total / count).astype(np.float32)
+    return result, {
+        **metadata,
+        "measurement_kind": "frame_average" if count > 1 else "single_frame",
+        "capture_start_time_ns": started,
+        "capture_end_time_ns": captured,
+        "averaging": {
+            "frame_count": count, "method": "arithmetic_mean",
+            "accumulator_dtype": "float64", "output_dtype": str(result.dtype),
+            "source_frame_dtype": str(dtype), "raw_frames_saved": False,
+            "top_level_camera_metadata": "last contributing camera frame",
+            "frames": samples,
+        },
+    }, frames
 
 
 class OutputWriter:
@@ -1078,6 +1143,32 @@ class OutputWriter:
         record["full_pattern_path"] = str(path.relative_to(self.output_dir))
         self._write_manifest()
 
+    def _save_burst_frames(self, record, frames, name):
+        """Checkpoint individual exposures after the average is safely recorded."""
+        if not frames:
+            return
+        averaging = record["averaging"]
+        if len(frames) != averaging["frame_count"]:
+            raise ValueError("Individual frame count differs from the recorded averaging count")
+        directory = self.output_dir / "raw_bursts" / name
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            for index, frame in enumerate(frames):
+                path = directory / f"sample_{index + 1:02d}.npy"
+                self._save_array(path, frame)
+                averaging["frames"][index]["raw_path"] = str(path.relative_to(self.output_dir))
+                self._write_manifest()
+            averaging["raw_frames_saved"] = True
+            self._write_manifest()
+        except (StorageWriteError, OSError) as exc:
+            averaging["raw_frames_saved"] = False
+            averaging["raw_frames_save_error"] = str(exc)
+            try:
+                self._write_manifest()
+            except StorageWriteError:
+                pass
+            raise
+
     def save_fringe_reference(
         self,
         frame: np.ndarray,
@@ -1085,6 +1176,7 @@ class OutputWriter:
         camera_metadata: dict[str, Any],
         display_time_ns: int,
         capture_time_ns: int,
+        raw_frames: Optional[list[np.ndarray]] = None,
     ) -> Path:
         """Keep every steering preview and point to the most recent reference."""
         reference_dir = self.output_dir / "reference"
@@ -1118,6 +1210,7 @@ class OutputWriter:
         }
         self.fringe_references.append(self.fringe_reference)
         self._write_manifest()
+        self._save_burst_frames(self.fringe_reference, raw_frames, f"reference_{reference_number:04d}")
         self._save_full_phase(phase_path, displayed_phase, self.fringe_reference)
         return preview_path
 
@@ -1150,6 +1243,7 @@ class OutputWriter:
         camera_metadata: dict[str, Any],
         display_time_ns: int,
         capture_time_ns: int,
+        raw_frames: Optional[list[np.ndarray]] = None,
     ) -> None:
         number = index + 1
         raw_path = self.raw_dir / f"frame_{number:04d}.npy"
@@ -1221,6 +1315,7 @@ class OutputWriter:
         }
         self.records.append(record)
         self._write_manifest()
+        self._save_burst_frames(record, raw_frames, f"frame_{number:04d}")
         if self.config.save_full_patterns:
             full_pattern_path = self.pattern_dir / f"phase_slm_{number:04d}.npy"
             self._save_full_phase(full_pattern_path, displayed_phase, record)
@@ -1294,16 +1389,21 @@ def sdk_version(value: str) -> tuple[int, int]:
     return major, minor
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(*, include_averaging: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Display NeuWS random-Zernike SLM patterns and record one camera frame each."
+        description="Display NeuWS random-Zernike SLM patterns and average camera images for each pattern."
     )
     parser.add_argument(
         "--num-patterns",
         type=positive_int,
         default=100,
-        help="Number of random-plus-fringe frames, excluding the optional fringe reference",
+        help="Number of random-plus-fringe patterns, excluding the optional fringe reference",
     )
+    if include_averaging:
+        parser.add_argument("--frames-per-pattern", type=positive_int, default=10,
+                            help="Camera images averaged for each fixed pattern, including fringe references (default: 10)")
+        parser.add_argument("--save-burst-frames", action=argparse.BooleanOptionalAction, default=True,
+                            help="Save individual camera images as well as the average (default: enabled)")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Use simulated SLM and camera")
@@ -1498,11 +1598,15 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         dry_run=args.dry_run,
         capture_fringe_first=args.capture_fringe_first or args.confirm_fringe_preview,
         confirm_fringe_preview=args.confirm_fringe_preview,
+        frames_per_pattern=getattr(args, "frames_per_pattern", 1),
+        save_burst_frames=getattr(args, "save_burst_frames", False),
     )
 
 
 def run(config: ExperimentConfig, output_dir: Path) -> bool:
     """Acquire a sequence; return False if fringe review stops the run early."""
+    if not isinstance(config.frames_per_pattern, int) or config.frames_per_pattern < 1:
+        raise ValueError("frames_per_pattern must be a positive integer")
     writer = OutputWriter(output_dir, config)
     generator = NeuWSPatternGenerator(config)
     slm = SimulatedSLM(config) if config.dry_run else HoloeyeSLM(config)
@@ -1515,12 +1619,14 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
 
     def display_and_capture(
         phase: np.ndarray,
-    ) -> tuple[np.ndarray, dict[str, Any], int, int]:
+    ) -> tuple[np.ndarray, dict[str, Any], int, int, list[np.ndarray]]:
         slm.show(phase)
         display_time_ns = time.time_ns()
         time.sleep(config.settle_ms / 1000.0)
-        frame, camera_metadata = camera.capture(phase)
-        return frame, camera_metadata, display_time_ns, time.time_ns()
+        frame, camera_metadata, raw_frames = capture_average(
+            camera, phase, config.frames_per_pattern, keep_frames=config.save_burst_frames,
+        )
+        return frame, camera_metadata, display_time_ns, camera_metadata["capture_end_time_ns"], raw_frames
 
     try:
         slm.open()
@@ -1528,7 +1634,7 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
         if config.capture_fringe_first or config.confirm_fringe_preview:
             while True:
                 fringe_phase = generator.fringe_only()
-                frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
+                frame, camera_metadata, display_time_ns, capture_time_ns, raw_frames = display_and_capture(
                     fringe_phase
                 )
                 preview_path = writer.save_fringe_reference(
@@ -1537,8 +1643,9 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
                     camera_metadata,
                     display_time_ns,
                     capture_time_ns,
+                    raw_frames,
                 )
-                print(f"[reference] saved fringe-only {frame.shape} {frame.dtype} frame")
+                print(f"[reference] saved fringe-only {frame.shape} {frame.dtype} mean of {config.frames_per_pattern} camera image(s)")
                 if not config.confirm_fringe_preview:
                     break
                 approved = confirm_fringe_preview(preview_path, config)
@@ -1557,7 +1664,7 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
                 break
         for index in range(config.num_patterns):
             displayed_phase, modulation, coefficients = generator.next()
-            frame, camera_metadata, display_time_ns, capture_time_ns = display_and_capture(
+            frame, camera_metadata, display_time_ns, capture_time_ns, raw_frames = display_and_capture(
                 displayed_phase
             )
             writer.save(
@@ -1569,10 +1676,11 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
                 camera_metadata,
                 display_time_ns,
                 capture_time_ns,
+                raw_frames,
             )
             print(
                 f"[{index + 1:04d}/{config.num_patterns:04d}] "
-                f"saved {frame.shape} {frame.dtype} frame"
+                f"saved {frame.shape} {frame.dtype} mean of {config.frames_per_pattern} camera image(s)"
             )
     except KeyboardInterrupt:
         print("Acquisition interrupted; completed frames are preserved", file=sys.stderr)

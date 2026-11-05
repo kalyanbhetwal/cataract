@@ -408,7 +408,8 @@ def render_diagnostics(first, result, output):
 
 
 def main(argv=None):
-    parser = acquisition_parser()
+    # Calibration already captures and averages its own --repeats per ramp.
+    parser = acquisition_parser(include_averaging=False)
     parser.description = __doc__
     parser.set_defaults(
         slm_width=1920, slm_height=1200, exposure_ms=10.0, settle_ms=1000.0,

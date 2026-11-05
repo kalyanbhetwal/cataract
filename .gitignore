@@ -9,6 +9,8 @@
 data/
 output/
 /processed/
+/calibration_850nm_*.zip
+/measurement_850nm_*.zip
 tmp/
 *.npy
 SLM_raw*.mat
@@ -16,6 +18,12 @@ SLM_sim*.mat
 manifest.json
 datameasurement_aa/
 analysis/
+
+# Local-only server reconstruction and transfer tools
+/neuws_server/
+/prepare_neuws_transfer.py
+/test_neuws_transfer.py
+/test_camera_observation.py
 
 # Python environments and caches
 .venv/
@@ -30,3 +38,4 @@ __pycache__/
 # Local/editor artifacts
 .DS_Store
 *.log
+SESSION_NOTES_2026-11-03.md
