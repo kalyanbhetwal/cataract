@@ -6,7 +6,7 @@
 *.dll
 
 # Acquisition and generated experiment data
-data/
+/data/*
 output/
 /processed/
 /measurement_*/
@@ -19,6 +19,13 @@ SLM_sim*.mat
 manifest.json
 datameasurement_aa/
 analysis/
+
+# NeuWS acquisition inputs: allow the phase sequence and its provenance only.
+!/data/neuws_dog_esophagus_phases/
+/data/neuws_dog_esophagus_phases/*
+!/data/neuws_dog_esophagus_phases/SLM_sim*.mat
+!/data/neuws_dog_esophagus_phases/SOURCE.txt
+!/data/neuws_dog_esophagus_phases/checksums.json
 
 # Local-only server reconstruction and transfer tools
 /neuws_server/

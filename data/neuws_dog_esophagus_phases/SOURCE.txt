@@ -1,0 +1,7 @@
+Published NeuWS modulation patterns: dog_esophagus_0.5diffuser
+Source: https://doi.org/10.5061/dryad.6t1g1jx42
+Copied without modification from the existing released dataset on Nexus.
+MAT variable proj_sim: 144x256 double, unwrapped radians.
+Only SLM_sim1.mat through SLM_sim100.mat are used for replay.
+Use --phase-pattern-dir data/neuws_dog_esophagus_phases.
+Camera measurements from the released dataset are not part of this package.

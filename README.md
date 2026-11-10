@@ -3,6 +3,8 @@
 This repository covers data collection, SLM/camera calibration, and offline
 preprocessing. Generated data, server reconstruction tools, and transfer
 utilities are kept locally and excluded from version control.
+The NeuWS acquisition phase files and their provenance are allowed in version
+control under `data/neuws_dog_esophagus_phases/`.
 
 `acquire_slm_camera.py` defaults to replaying the NeuWS modulation arrays in
 `data/neuws_dog_esophagus_phases/` beside the script. Install these phase files
@@ -165,9 +167,11 @@ without `--heds-examples-dir`. As another supported option, copy the complete
 
 Use the actual `proj_sim` arrays from
 `dog_esophagus_0.5diffuser/Zernike_SLM_data/SLM_sim1.mat` through `SLM_sim100.mat`.
-The prepared, local-only folder is `data/neuws_dog_esophagus_phases/`. To move
-it to the acquisition PC, copy `data/neuws_dog_esophagus_phases.zip` into that
-checkout's `data/` directory, then extract it there:
+Keep the prepared folder `data/neuws_dog_esophagus_phases/` with the scripts in
+version control: all 100 phase MAT files, `SOURCE.txt`, and `checksums.json`.
+After these files are committed and pulled onto the acquisition PC, no ZIP
+extraction is needed. If that checkout does not yet have the folder, copy
+`data/neuws_dog_esophagus_phases.zip` into its `data/` directory and extract it:
 
 ```powershell
 Expand-Archive data\neuws_dog_esophagus_phases.zip -DestinationPath data
@@ -177,8 +181,8 @@ This is the default directory, resolved beside the script even when launched
 from a different working directory. Alternatively, point `--phase-pattern-dir` at the
 `Zernike_SLM_data` directory. The data source is
 [the NeuWS release](https://doi.org/10.5061/dryad.6t1g1jx42).
-The folder and ZIP are data assets excluded from git; updating the scripts alone
-does not install these phase files on another computer.
+The phase folder is an explicit exception to the data ignore rules. ZIP
+bundles, camera measurements, and processed outputs remain excluded from git.
 The complete local update bundle `data/neuws_replay_acquisition_update_20261110_v2.zip`
 includes the updated scripts and this phase folder for the acquisition PC.
 

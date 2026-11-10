@@ -27,9 +27,11 @@ Get-PSDrive -PSProvider FileSystem
 python -m pip install -r requirements.txt
 
 # CURRENT 633 NM RUN: replay the dog_esophagus_0.5diffuser proj_sim arrays.
+# The 100 MATs, SOURCE.txt and checksums.json in data\neuws_dog_esophagus_phases are allowed in git.
+# Once committed and pulled onto the acquisition PC, no ZIP extraction is needed.
 # The complete data\neuws_replay_acquisition_update_20261110_v2.zip contains scripts and phase files; extract into the acquisition checkout.
-# Copy the local-only data\neuws_dog_esophagus_phases.zip to the acquisition PC first.
-# Updating the repository does not copy these ignored data files. Skip this extraction if using the complete bundle; otherwise extract once if the folder is absent:
+# ZIP alternative: if the phase folder is absent, copy data\neuws_dog_esophagus_phases.zip to the acquisition PC and extract it once.
+# Skip this command if the phase folder is already present (from git or the complete bundle):
 Expand-Archive data\neuws_dog_esophagus_phases.zip -DestinationPath data
 # Use a new output directory for each run. All 100 MATs are validated before hardware opens.
 # Preserves phase values; nearest-neighbor resize to SLM, add accepted P15 fringe, wrap for display.
