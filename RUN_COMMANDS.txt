@@ -1,6 +1,6 @@
 # Windows PowerShell commands. Run one command at a time from this project directory.
 # Replace the HEDS path, camera serial, and wavelength with the values for your setup.
-# Session notes confirm an 850 nm laser and camera serial 20100892. Hardware examples below explicitly use 850 nm and 10 ms exposure. Keep the matching optical configuration.
+# The current replay command uses 633 nm, P15 and 20 ms; older examples below are explicitly labeled 850 nm. Camera serial: 20100892.
 # On the acquisition PC, activate the environment containing PySpin before running these commands.
 conda activate slm-ctl
 # "horizontal" means horizontal fringe lines; the phase ramp varies top-to-bottom along y.
@@ -23,6 +23,17 @@ Get-PSDrive -PSProvider FileSystem
 
 # Install Python dependencies.
 python -m pip install -r requirements.txt
+
+# CURRENT 633 NM RUN: replay the released dog_esophagus_0.5diffuser proj_sim arrays.
+# Copy the local-only data\neuws_dog_esophagus_phases.zip to the acquisition PC first.
+# Updating the repository does not copy these ignored data files. Extract once if the folder is absent:
+Expand-Archive data\neuws_dog_esophagus_phases.zip -DestinationPath data
+# Use a new output directory for each run. All 100 MATs are validated before hardware opens.
+# Preserves phase values; nearest-neighbor resize to SLM, add accepted P15 fringe, wrap for display.
+# Saves ten-image averages and all individual camera frames; no camera scaling/rotation during capture.
+python acquire_slm_camera.py --phase-pattern-dir data\neuws_dog_esophagus_phases --num-patterns 100 --frames-per-pattern 10 --save-burst-frames --capture-fringe-first --confirm-fringe-preview --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 15 --wavelength-nm 633 --exposure-ms 20 --gain-db 0 --gamma 1 --pixel-format Mono16 --settle-ms 1000 --discard-frames 2 --slm-preselect "index:0" --camera-serial 20100892 --no-neuws-processing --output-format npy --output-dir data\measurement_633nm_replay_001
+# SOFTWARE CHECK: first three released patterns with a simulated camera, including ten-exposure averages and burst files.
+python acquire_slm_camera.py --dry-run --phase-pattern-dir data\neuws_dog_esophagus_phases --num-patterns 3 --frames-per-pattern 10 --save-burst-frames --capture-fringe-first --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --fringe-period-pixels 15 --wavelength-nm 633 --exposure-ms 20 --settle-ms 0 --no-neuws-processing --output-format npy --output-dir data\replay_dry_run_001
 
 # Simulate the full sequence with preview feedback: answer Y for 3 more simulated frames, or N to stop. Simulated frames test software flow, not optical order separation.
 python acquire_slm_camera.py --frames-per-pattern 10 --save-burst-frames --dry-run --capture-fringe-first --confirm-fringe-preview --num-patterns 3 --slm-width 1920 --slm-height 1200 --fringe-orientation horizontal --settle-ms 300 --discard-frames 2 --no-neuws-processing --output-format npy

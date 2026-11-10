@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 import math
 import sys
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import numpy as np
+from scipy.io import loadmat, savemat
 
 from camera_smoke_test import make_preview_u8
 
@@ -75,6 +77,109 @@ def test_config(seed=7):
 
 
 class PatternTests(unittest.TestCase):
+    def test_replay_preserves_values_numeric_order_and_cached_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            yy, xx = np.indices((144, 256))
+            phases = []
+            for index in range(1, 11):
+                phase = index + yy * .137 - xx * .071 + 1e-10
+                phases.append(phase)
+                savemat(root / f'SLM_sim{index}.mat', {'proj_sim': phase})
+            config = replace(test_config(), num_patterns=10, phase_pattern_dir=str(root),
+                             slm_height=288, slm_width=512, coefficient_std_rad=0)
+            generator = NeuWSPatternGenerator(config)
+            hashes = [hashlib.sha256((root / f'SLM_sim{i}.mat').read_bytes()).hexdigest() for i in range(1, 11)]
+            # Steering changes and changes to disk files cannot alter the preloaded sequence.
+            (root / 'SLM_sim1.mat').unlink()
+            accepted = replace(config, fringe_orientation='horizontal', fringe_slope_rad_per_pixel=.2)
+            generator.update_fringe(accepted)
+            generator.fringe_only()
+            for index, expected_phase in enumerate(phases):
+                displayed, modulation, coefficients = generator.next()
+                np.testing.assert_array_equal(modulation, expected_phase)
+                self.assertEqual(modulation.dtype, np.float64)
+                self.assertIsNone(coefficients)
+                enlarged = np.repeat(np.repeat(expected_phase, 2, axis=0), 2, axis=1)
+                fringe = np.mod(.2 * np.arange(288), 2*math.pi)[:, None]
+                expected = np.mod(enlarged + fringe, 2*math.pi).astype(np.float32)
+                np.minimum(expected, np.nextafter(np.float32(2*math.pi), np.float32(0)), out=expected)
+                np.testing.assert_array_equal(displayed, expected)
+                self.assertGreaterEqual(displayed.min(), 0)
+                self.assertLess(displayed.max(), 2*math.pi)
+                self.assertEqual(generator.pattern_metadata(index)['source_file_sha256'], hashes[index])
+                self.assertEqual(generator.pattern_metadata(index)['source_pattern_index'], index+1)
+            with self.assertRaisesRegex(ValueError, 'exhausted'):
+                generator.next()
+
+    def test_replay_validation_finishes_before_output_or_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'patterns'; source.mkdir()
+            valid = np.ones((144, 256), dtype=np.float64)
+            config = replace(test_config(), dry_run=False, num_patterns=2, phase_pattern_dir=str(source))
+            cases = [None, b'truncated MAT', {'wrong_key': valid}, {'proj_sim': np.ones((256,256))},
+                     {'proj_sim': valid * np.nan}, {'proj_sim': valid.astype(complex) + 1j},
+                     {'proj_sim': np.array([['text']])}]
+            for case in cases:
+                savemat(source / 'SLM_sim1.mat', {'proj_sim': valid})
+                path = source / 'SLM_sim2.mat'; path.unlink(missing_ok=True)
+                if isinstance(case, bytes):
+                    path.write_bytes(case)
+                elif case is not None:
+                    savemat(path, case)
+                with self.subTest(case=list(case) if case else 'missing'), patch('acquire_slm_camera.HoloeyeSLM') as slm:
+                    with self.assertRaises(ValueError):
+                        run(config, root / 'output')
+                    slm.assert_not_called()
+                    self.assertFalse((root / 'output').exists())
+
+    def test_replay_capture_and_offline_export_keep_identity_and_full_phase(self):
+        from process_measurements import process_run
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'patterns'; source.mkdir()
+            phases = [np.linspace(-19, 23, 144*256).reshape(144,256) + i + 1e-10 for i in range(2)]
+            for i, phase in enumerate(phases, 1):
+                savemat(source / f'SLM_sim{i}.mat', {'proj_sim': phase})
+            config = replace(test_config(), phase_pattern_dir=str(source), frames_per_pattern=2,
+                             save_burst_frames=True, neuws_processing=False, output_format='mat',
+                             capture_fringe_first=True, confirm_fringe_preview=True)
+            accepted = replace(config, fringe_slope_rad_per_pixel=.3, fringe_orientation='horizontal')
+            slm, camera = Mock(), Mock()
+            camera.capture.side_effect = [(np.full((12,16), 100+i, dtype=np.uint16), {'frame_id':i}) for i in range(8)]
+            out = root / 'acquisition'
+            with (patch('acquire_slm_camera.SimulatedSLM', return_value=slm),
+                  patch('acquire_slm_camera.SimulatedCamera', return_value=camera),
+                  patch('acquire_slm_camera.confirm_fringe_preview', side_effect=[accepted, True]),
+                  patch('acquire_slm_camera.time.sleep'), patch('sys.stdout', new_callable=io.StringIO)):
+                self.assertTrue(run(config, out))
+            manifest = json.loads((out / 'manifest.json').read_text())
+            self.assertEqual(len(manifest['fringe_references']), 2)
+            self.assertEqual(manifest['phase_pattern_source']['kind'], 'mat_replay')
+            self.assertFalse(manifest['phase_pattern_source']['random_generation_parameters_used'])
+            for i, record in enumerate(manifest['frames']):
+                self.assertIsNone(record['zernike_coefficients_rad'])
+                np.testing.assert_array_equal(np.load(out / record['modulation_path']), phases[i])
+                np.testing.assert_array_equal(loadmat(out / f'neuws_mat/SLM_sim{i+1}.mat')['proj_sim'], phases[i])
+                self.assertEqual(record['phase_pattern_source']['source_file'], f'SLM_sim{i+1}.mat')
+                burst = record['averaging']
+                self.assertTrue(burst['raw_frames_saved'])
+                np.testing.assert_array_equal(np.load(out / record['raw_path']),
+                    np.mean([np.load(out / f['raw_path']) for f in burst['frames']], axis=0))
+            with patch('sys.stdout', new_callable=io.StringIO):
+                processed = process_run(out, root / 'processed', roi=(2,1,10,8),
+                                        preserve_camera_orientation=True, include_full_phase=True, export_mat=True)
+            for i, record in enumerate(processed['frames']):
+                with np.load(root / 'processed' / record['pair_path'], allow_pickle=False) as pair:
+                    np.testing.assert_array_equal(pair['phase_modulation_rad'], phases[i])
+                    np.testing.assert_array_equal(pair['phase_slm_rad'], slm.show.call_args_list[i+2].args[0])
+                    self.assertEqual(pair['zernike_coefficients_rad'].size, 0)
+                    self.assertFalse(pair['zernike_coefficients_available'])
+                self.assertEqual(record['phase_pattern_source'], manifest['frames'][i]['phase_pattern_source'])
+                self.assertEqual(record['full_phase_source'], 'reconstructed_from_saved_modulation')
+                np.testing.assert_array_equal(loadmat(root / 'processed' / f'neuws_mat/SLM_sim{i+1}.mat')['proj_sim'], phases[i])
+
     def test_first_fifteen_indices(self):
         self.assertEqual(len(noll_indices(15)), 15)
         self.assertEqual(noll_indices(6), [(0, 0), (1, -1), (1, 1), (2, -2), (2, 0), (2, 2)])

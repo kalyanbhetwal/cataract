@@ -4,7 +4,9 @@ This repository covers data collection, SLM/camera calibration, and offline
 preprocessing. Generated data, server reconstruction tools, and transfer
 utilities are kept locally and excluded from version control.
 
-`acquire_slm_camera.py` reproduces the acquisition recipe from pages 3-5 of
+`acquire_slm_camera.py` can replay the released NeuWS modulation arrays with
+`--phase-pattern-dir`. Without that option it generates random Zernike patterns
+using the existing local basis. The acquisition recipe is based on pages 3-5 of
 `sciadv.adg4671_sm.pdf`:
 
 - HOLOEYE LETO-3 phase resolution: 1080 x 1920.
@@ -153,6 +155,63 @@ without `--heds-examples-dir`. As another supported option, copy the complete
 `acquire_slm_camera.py`.
 
 ## 4. Acquire data
+
+### Replay the released NeuWS patterns — current 633 nm experiment
+
+Use the actual `proj_sim` arrays from
+`dog_esophagus_0.5diffuser/Zernike_SLM_data/SLM_sim1.mat` through `SLM_sim100.mat`.
+The prepared, local-only folder is `data/neuws_dog_esophagus_phases/`. To move
+it to the acquisition PC, copy `data/neuws_dog_esophagus_phases.zip` into that
+checkout's `data/` directory, then extract it there:
+
+```powershell
+Expand-Archive data\neuws_dog_esophagus_phases.zip -DestinationPath data
+```
+
+Alternatively, point `--phase-pattern-dir` directly at the released
+`Zernike_SLM_data` directory. The data source is
+[the NeuWS release](https://doi.org/10.5061/dryad.6t1g1jx42).
+The folder and ZIP are data assets excluded from git; updating the scripts alone
+does not install these phase files on another computer.
+
+With the current 633 nm laser, 1920x1200 SLM, P15 horizontal steering and 20 ms
+exposure, collect the fringe reference and 100 replayed patterns using:
+
+```powershell
+python acquire_slm_camera.py `
+  --phase-pattern-dir data\neuws_dog_esophagus_phases `
+  --num-patterns 100 --frames-per-pattern 10 --save-burst-frames `
+  --capture-fringe-first --confirm-fringe-preview `
+  --slm-width 1920 --slm-height 1200 `
+  --fringe-orientation horizontal --fringe-period-pixels 15 `
+  --wavelength-nm 633 --exposure-ms 20 --gain-db 0 --gamma 1 `
+  --pixel-format Mono16 --settle-ms 1000 --discard-frames 2 `
+  --slm-preselect "index:0" --camera-serial 20100892 `
+  --no-neuws-processing --output-format npy `
+  --output-dir data\measurement_633nm_replay_001
+```
+
+Choose a new output directory for each acquisition. The replay mode validates
+every requested MAT file before opening hardware: `proj_sim` must be a finite,
+real 144x256 array in radians. Patterns run in numeric order, starting at 1,
+without cycling. `--num-patterns 3` uses the first three files. Steering retries
+do not advance or reload the prevalidated sequence.
+
+The saved modulation keeps the source values and precision, including nonzero
+corners. It is nearest-neighbor resized to the configured SLM dimensions, added
+to the accepted steering fringe, wrapped to `2*pi`, and converted to float32
+for display. `--seed`, `--zernike-modes` and `--coefficient-std-rad` do not change
+replayed patterns. Each manifest record includes the source filename, numeric
+index and SHA256; unavailable generating coefficients are recorded as `null`.
+Offline preprocessing retains this provenance and can reconstruct the full
+display phase from the saved modulation and accepted fringe.
+
+This command averages ten exposures and saves all individual frames for each
+pattern and reference. It retains full camera images for later scale-and-crop
+processing. Replaying the patterns does not establish a new 633 nm calibration
+or make the 1920x1200 SLM aspect ratio identical to the paper's 1920x1080 device.
+
+### Generated-pattern acquisition
 
 Close SpinView and any HOLOEYE example that has exclusive control of a device,
 then start with a short, low-risk run:

@@ -94,10 +94,12 @@ def _basis(modes: int) -> np.ndarray:
     return zernike_basis(256, modes)
 
 
-def reconstruct_full_phase(config: dict, coefficients: np.ndarray) -> np.ndarray:
-    """Rebuild a missing full phase from coefficients, never from camera coordinates."""
-    phase_256 = np.tensordot(coefficients, _basis(len(coefficients)), axes=(0, 0))
-    modulation = resize_nearest(phase_256[56:200], (config["slm_height"], config["slm_width"]))
+def reconstruct_full_phase(config: dict, coefficients: np.ndarray, modulation: np.ndarray | None = None) -> np.ndarray:
+    """Rebuild the display from saved modulation or legacy generating coefficients."""
+    if modulation is None:
+        phase_256 = np.tensordot(coefficients, _basis(len(coefficients)), axes=(0, 0))
+        modulation = phase_256[56:200]
+    modulation = resize_nearest(modulation, (config["slm_height"], config["slm_width"]))
     slope = config["fringe_slope_rad_per_pixel"]
     if config["fringe_orientation"] == "horizontal":
         fringe = np.mod(slope * np.arange(config["slm_height"], dtype=np.float64), TWO_PI)[:, None]
@@ -291,6 +293,7 @@ def process_run(
         ),
         "calibrated_sampling": sampler.info if sampler is not None else None,
         "phase_processing": "Original SLM modulation is paired by source pattern index; camera ROI is not applied to SLM phase",
+        "phase_pattern_source": source.get("phase_pattern_source"),
         "include_full_phase": include_full_phase,
         "export_mat": export_mat,
         "excluded_source_pattern_indices": sorted(exclusions),
@@ -308,13 +311,15 @@ def process_run(
         raw = np.load(source_path(input_dir, record["raw_path"]), allow_pickle=False)
         cropped = crop_frame(raw, roi)
         modulation = np.load(source_path(input_dir, record["modulation_path"]), allow_pickle=False)
-        coefficients = np.asarray(record["zernike_coefficients_rad"], dtype=np.float64)
+        coefficient_values = record["zernike_coefficients_rad"]
+        coefficients = np.asarray(coefficient_values if coefficient_values is not None else [], dtype=np.float64)
         if modulation.ndim != 2 or not np.all(np.isfinite(modulation)):
             raise ValueError(f"Invalid modulation phase for source frame {source_index}")
         arrays = {
             "image": cropped,
             "phase_modulation_rad": modulation,
             "zernike_coefficients_rad": coefficients,
+            "zernike_coefficients_available": np.asarray(coefficient_values is not None),
             "source_pattern_index": np.asarray(source_index, dtype=np.int64),
             "camera_roi_xywh": np.asarray(roi, dtype=np.int64),
             "slm_shape": np.asarray([config["slm_height"], config["slm_width"]], dtype=np.int64),
@@ -346,8 +351,12 @@ def process_run(
                 phase = np.load(source_path(input_dir, full_path), allow_pickle=False)
                 phase_source = "saved_full_phase"
             else:
-                phase = reconstruct_full_phase(config, coefficients)
-                phase_source = "reconstructed_from_coefficients"
+                if coefficient_values is None:
+                    phase = reconstruct_full_phase(config, coefficients, modulation=modulation)
+                    phase_source = "reconstructed_from_saved_modulation"
+                else:
+                    phase = reconstruct_full_phase(config, coefficients)
+                    phase_source = "reconstructed_from_coefficients"
             expected_shape = (config["slm_height"], config["slm_width"])
             if phase.shape != expected_shape or not np.all(np.isfinite(phase)):
                 raise ValueError(f"Invalid full SLM phase for source frame {source_index}")
@@ -386,6 +395,7 @@ def process_run(
         manifest["frames"].append({
             "output_index": output_index,
             "source_pattern_index": source_index,
+            "phase_pattern_source": record.get("phase_pattern_source"),
             "source_frame_id": record.get("frame_id"),
             "source_display_time_ns": record.get("display_time_ns"),
             "source_capture_time_ns": record.get("capture_time_ns"),

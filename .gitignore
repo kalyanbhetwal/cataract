@@ -9,8 +9,9 @@
 data/
 output/
 /processed/
+/measurement_*/
 /calibration_850nm_*.zip
-/measurement_850nm_*.zip
+/measurement_*.zip
 tmp/
 *.npy
 SLM_raw*.mat

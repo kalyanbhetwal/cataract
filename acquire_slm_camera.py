@@ -10,7 +10,9 @@ validate pattern generation and output without either device.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib
+import io
 import json
 import math
 import os
@@ -71,6 +73,7 @@ class ExperimentConfig:
     confirm_fringe_preview: bool = False
     frames_per_pattern: int = 10
     save_burst_frames: bool = True
+    phase_pattern_dir: Optional[str] = None
 
 
 def noll_indices(count: int) -> list[tuple[int, int]]:
@@ -312,13 +315,72 @@ def confirm_fringe_preview(
 
 
 class NeuWSPatternGenerator:
-    """Generate deterministic paper-style random Zernike phase patterns."""
+    """Generate Zernike patterns or replay saved, unwrapped NeuWS modulation."""
 
     def __init__(self, config: ExperimentConfig):
         self.config = config
         self._rng = np.random.default_rng(config.seed)
-        self._basis = zernike_basis(256, config.zernike_modes)
+        self._basis = None
+        self._replay: list[np.ndarray] = []
+        self._replay_metadata: list[dict[str, Any]] = []
+        self._index = 0
+        if config.phase_pattern_dir is None:
+            self._basis = zernike_basis(256, config.zernike_modes)
+            self.source_metadata = {"kind": "generated_zernike", "random_generation_parameters_used": True}
+        else:
+            self._load_replay(Path(config.phase_pattern_dir))
         self._crop_start = (256 - 144) // 2
+        self.update_fringe(config)
+
+    def _load_replay(self, directory: Path) -> None:
+        """Read and validate the complete requested sequence before hardware opens."""
+        try:
+            from scipy.io import loadmat
+            from scipy.io.matlab import MatReadError
+        except ImportError as exc:
+            raise RuntimeError("--phase-pattern-dir requires scipy; install requirements.txt") from exc
+        directory = directory.expanduser().resolve()
+        if not directory.is_dir():
+            raise ValueError(f"Phase pattern directory does not exist: {directory}")
+        for index in range(1, self.config.num_patterns + 1):
+            path = directory / f"SLM_sim{index}.mat"
+            if not path.is_file():
+                raise ValueError(f"Missing replay phase pattern: {path}")
+            payload = path.read_bytes()
+            try:
+                contents = loadmat(io.BytesIO(payload), variable_names=['proj_sim'])
+            except (ValueError, TypeError, OSError, NotImplementedError, MatReadError) as exc:
+                raise ValueError(f"Cannot read replay MAT file {path}: {exc}") from exc
+            phase = contents.get('proj_sim')
+            if (not isinstance(phase, np.ndarray) or phase.shape != (144, 256)
+                    or phase.dtype.kind not in 'fiu' or not np.isfinite(phase).all()):
+                raise ValueError(f"{path}: proj_sim must be a finite, real 144x256 array in radians")
+            # Keep the source precision and values; wrap only the full SLM display.
+            phase = phase.copy()
+            self._replay.append(phase)
+            self._replay_metadata.append({
+                'kind': 'mat_replay', 'source_pattern_index': index,
+                'source_file': path.name, 'source_file_sha256': hashlib.sha256(payload).hexdigest(),
+                'variable': 'proj_sim', 'shape': list(phase.shape), 'dtype': str(phase.dtype),
+                'units': 'radians', 'phase_values_modified': False,
+            })
+        self.source_metadata = {
+            'kind': 'mat_replay', 'directory': str(directory),
+            'requested_patterns': self.config.num_patterns,
+            'order': 'SLM_sim1.mat through SLM_simN.mat, numeric order; no cycling',
+            'random_generation_parameters_used': False,
+            'display_processing': 'Nearest-neighbor resize to configured SLM dimensions, add selected steering fringe, wrap to 2*pi, convert display to float32',
+            'files': self._replay_metadata,
+        }
+
+    def pattern_metadata(self, index: int) -> dict[str, Any]:
+        if self.config.phase_pattern_dir is not None:
+            return dict(self._replay_metadata[index])
+        return {'kind': 'generated_zernike', 'source_pattern_index': index + 1}
+
+    def update_fringe(self, config: ExperimentConfig) -> None:
+        """Change steering without reloading or advancing the modulation sequence."""
+        self.config = config
         if config.fringe_orientation == "vertical":
             # Vertical fringe lines: phase changes left-to-right (along x).
             coordinate = np.arange(config.slm_width, dtype=np.float64)
@@ -349,17 +411,18 @@ class NeuWSPatternGenerator:
         np.minimum(displayed_phase, maximum_phase, out=displayed_phase)
         return displayed_phase
 
-    def next(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        coefficients = self._rng.normal(
-            0.0,
-            self.config.coefficient_std_rad,
-            self.config.zernike_modes,
-        )
-        phase_256 = np.tensordot(coefficients, self._basis, axes=(0, 0))
-        phase_144 = phase_256[
-            self._crop_start : self._crop_start + 144,
-            :,
-        ]
+    def next(self) -> tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+        if self.config.phase_pattern_dir is not None:
+            if self._index >= len(self._replay):
+                raise ValueError("Replay phase sequence exhausted; patterns are never repeated automatically")
+            phase_144 = self._replay[self._index]
+            coefficients = None  # The MAT files do not supply generating coefficients.
+        else:
+            coefficients = self._rng.normal(
+                0.0, self.config.coefficient_std_rad, self.config.zernike_modes,
+            )
+            phase_256 = np.tensordot(coefficients, self._basis, axes=(0, 0))
+            phase_144 = phase_256[self._crop_start : self._crop_start + 144, :]
         modulation = resize_nearest(
             phase_144,
             (self.config.slm_height, self.config.slm_width),
@@ -368,7 +431,9 @@ class NeuWSPatternGenerator:
         # float32 can round a value just below 2*pi back up to 2*pi.
         maximum_phase = np.nextafter(np.float32(TWO_PI), np.float32(0.0))
         np.minimum(displayed_phase, maximum_phase, out=displayed_phase)
-        return displayed_phase, phase_144.astype(np.float32), coefficients
+        self._index += 1
+        saved_modulation = phase_144.copy() if coefficients is None else phase_144.astype(np.float32)
+        return displayed_phase, saved_modulation, coefficients
 
 
 def phase_to_u8(phase_rad: np.ndarray) -> np.ndarray:
@@ -1040,7 +1105,7 @@ def capture_average(camera, phase, count, *, keep_frames=False):
 
 
 class OutputWriter:
-    def __init__(self, output_dir: Path, config: ExperimentConfig):
+    def __init__(self, output_dir: Path, config: ExperimentConfig, pattern_source=None):
         self.output_dir = output_dir
         if output_dir.exists():
             if not output_dir.is_dir():
@@ -1082,6 +1147,7 @@ class OutputWriter:
         if config.output_format == "mat":
             self.neuws_dir.mkdir(parents=True, exist_ok=True)
         self.config = config
+        self.pattern_source = pattern_source
         self.records: list[dict[str, Any]] = []
         self.fringe_reference: Optional[dict[str, Any]] = None
         self.fringe_references: list[dict[str, Any]] = []
@@ -1239,11 +1305,12 @@ class OutputWriter:
         frame: np.ndarray,
         modulation: np.ndarray,
         displayed_phase: np.ndarray,
-        coefficients: np.ndarray,
+        coefficients: Optional[np.ndarray],
         camera_metadata: dict[str, Any],
         display_time_ns: int,
         capture_time_ns: int,
         raw_frames: Optional[list[np.ndarray]] = None,
+        phase_pattern_source: Optional[dict[str, Any]] = None,
     ) -> None:
         number = index + 1
         raw_path = self.raw_dir / f"frame_{number:04d}.npy"
@@ -1306,7 +1373,8 @@ class OutputWriter:
             "processed_preview_scale_99th_percentile": processed_preview_high,
             "modulation_path": str(modulation_path.relative_to(self.output_dir)),
             "full_pattern_path": None,
-            "zernike_coefficients_rad": coefficients.tolist(),
+            "zernike_coefficients_rad": coefficients.tolist() if coefficients is not None else None,
+            "phase_pattern_source": phase_pattern_source,
             "display_time_ns": display_time_ns,
             "capture_time_ns": capture_time_ns,
             "frame_dtype": str(frame.dtype),
@@ -1325,6 +1393,7 @@ class OutputWriter:
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "reference": "sciadv.adg4671_sm.pdf, pages 3-5",
             "configuration": asdict(self.config),
+            "phase_pattern_source": self.pattern_source,
             "frames_completed": len(self.records),
             "fringe_reference": self.fringe_reference,
             "fringe_references": self.fringe_references,
@@ -1389,16 +1458,19 @@ def sdk_version(value: str) -> tuple[int, int]:
     return major, minor
 
 
-def build_parser(*, include_averaging: bool = True) -> argparse.ArgumentParser:
+def build_parser(*, include_averaging: bool = True, include_pattern_replay: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Display NeuWS random-Zernike SLM patterns and average camera images for each pattern."
+        description="Display generated or replayed NeuWS SLM patterns and average camera images for each pattern."
     )
     parser.add_argument(
         "--num-patterns",
         type=positive_int,
         default=100,
-        help="Number of random-plus-fringe patterns, excluding the optional fringe reference",
+        help="Number of modulation-plus-fringe patterns, excluding the optional fringe reference",
     )
+    if include_pattern_replay:
+        parser.add_argument('--phase-pattern-dir', type=Path, metavar='PATH',
+                            help='Replay SLM_sim1.mat through SLM_simN.mat (proj_sim, 144x256 radians); seed, zernike-modes and coefficient-std-rad do not modify replayed patterns')
     if include_averaging:
         parser.add_argument("--frames-per-pattern", type=positive_int, default=10,
                             help="Camera images averaged for each fixed pattern, including fringe references (default: 10)")
@@ -1600,6 +1672,7 @@ def config_from_args(args: argparse.Namespace) -> ExperimentConfig:
         confirm_fringe_preview=args.confirm_fringe_preview,
         frames_per_pattern=getattr(args, "frames_per_pattern", 1),
         save_burst_frames=getattr(args, "save_burst_frames", False),
+        phase_pattern_dir=str(args.phase_pattern_dir.expanduser().resolve()) if getattr(args, 'phase_pattern_dir', None) is not None else None,
     )
 
 
@@ -1607,8 +1680,10 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
     """Acquire a sequence; return False if fringe review stops the run early."""
     if not isinstance(config.frames_per_pattern, int) or config.frames_per_pattern < 1:
         raise ValueError("frames_per_pattern must be a positive integer")
-    writer = OutputWriter(output_dir, config)
     generator = NeuWSPatternGenerator(config)
+    writer = OutputWriter(output_dir, config, pattern_source=generator.source_metadata)
+    if config.phase_pattern_dir is not None:
+        print(f"Replaying {config.num_patterns} saved phase patterns from {config.phase_pattern_dir}; random-generation parameters are unused")
     slm = SimulatedSLM(config) if config.dry_run else HoloeyeSLM(config)
     if config.dry_run:
         camera = SimulatedCamera(config)
@@ -1653,9 +1728,8 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
                     writer.save_fringe_feedback(None, next_config=approved)
                     config = approved
                     writer.config = config
-                    # No random patterns have been generated yet, so the seeded
-                    # sequence starts identically after any number of adjustments.
-                    generator = NeuWSPatternGenerator(config)
+                    # Keep the validated pattern cache and sequence intact.
+                    generator.update_fringe(config)
                     continue
                 writer.save_fringe_feedback(approved)
                 if approved is not True:
@@ -1677,6 +1751,7 @@ def run(config: ExperimentConfig, output_dir: Path) -> bool:
                 display_time_ns,
                 capture_time_ns,
                 raw_frames,
+                phase_pattern_source=generator.pattern_metadata(index),
             )
             print(
                 f"[{index + 1:04d}/{config.num_patterns:04d}] "
