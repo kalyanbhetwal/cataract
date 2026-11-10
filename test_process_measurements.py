@@ -17,7 +17,7 @@ from calibrated_sampling import FourierSampler, masked_preview
 def make_source(root):
     with patch("sys.stderr", new_callable=io.StringIO):
         config = config_from_args(build_parser().parse_args([
-            "--dry-run", "--num-patterns", "3", "--slm-width", "16", "--slm-height", "12",
+            "--dry-run", "--generated-patterns", "--num-patterns", "3", "--slm-width", "16", "--slm-height", "12",
             "--frames-per-pattern", "1",
         ]))
     config = replace(config, fringe_orientation="horizontal", fringe_slope_rad_per_pixel=0.3)

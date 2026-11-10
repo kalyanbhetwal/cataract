@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Display NeuWS-style phase patterns and average camera frames per pattern.
+"""Replay NeuWS phase patterns and average camera frames per pattern.
 
 The pattern recipe follows pages 4-5 of sciadv.adg4671_sm.pdf. Hardware mode
 defaults to the HOLOEYE SLM Display SDK and FLIR/Point Grey Spinnaker (PySpin).
 An optional Player One backend is available for later use. Use --dry-run to
-validate pattern generation and output without either device.
+validate replay and output without either device. The saved NeuWS modulation
+sequence is the default; local random generation requires --generated-patterns.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import numpy as np
 
 
 TWO_PI = 2.0 * math.pi
+DEFAULT_PHASE_PATTERN_DIR = Path(__file__).resolve().parent / "data" / "neuws_dog_esophagus_phases"
 
 
 class StorageWriteError(RuntimeError):
@@ -73,7 +75,7 @@ class ExperimentConfig:
     confirm_fringe_preview: bool = False
     frames_per_pattern: int = 10
     save_burst_frames: bool = True
-    phase_pattern_dir: Optional[str] = None
+    phase_pattern_dir: Optional[str] = str(DEFAULT_PHASE_PATTERN_DIR)
 
 
 def noll_indices(count: int) -> list[tuple[int, int]]:
@@ -341,7 +343,11 @@ class NeuWSPatternGenerator:
             raise RuntimeError("--phase-pattern-dir requires scipy; install requirements.txt") from exc
         directory = directory.expanduser().resolve()
         if not directory.is_dir():
-            raise ValueError(f"Phase pattern directory does not exist: {directory}")
+            raise ValueError(
+                f"Phase pattern directory does not exist: {directory}. "
+                "Install the NeuWS phase MAT files there or supply --phase-pattern-dir PATH. "
+                "No random patterns were substituted."
+            )
         for index in range(1, self.config.num_patterns + 1):
             path = directory / f"SLM_sim{index}.mat"
             if not path.is_file():
@@ -1469,31 +1475,42 @@ def build_parser(*, include_averaging: bool = True, include_pattern_replay: bool
         help="Number of modulation-plus-fringe patterns, excluding the optional fringe reference",
     )
     if include_pattern_replay:
-        parser.add_argument('--phase-pattern-dir', type=Path, metavar='PATH',
-                            help='Replay SLM_sim1.mat through SLM_simN.mat (proj_sim, 144x256 radians); seed, zernike-modes and coefficient-std-rad do not modify replayed patterns')
+        pattern_source = parser.add_mutually_exclusive_group()
+        pattern_source.add_argument(
+            '--phase-pattern-dir', type=Path, metavar='PATH',
+            help='Replay SLM_sim1.mat through SLM_simN.mat (proj_sim, 144x256 radians); '
+                 'default: data/neuws_dog_esophagus_phases beside this script',
+        )
+        pattern_source.add_argument(
+            '--generated-patterns', dest='phase_pattern_dir', action='store_const', const=None,
+            help='Explicitly use the legacy local random Zernike generator instead of saved NeuWS patterns',
+        )
+        parser.set_defaults(phase_pattern_dir=DEFAULT_PHASE_PATTERN_DIR)
     if include_averaging:
         parser.add_argument("--frames-per-pattern", type=positive_int, default=10,
                             help="Camera images averaged for each fixed pattern, including fringe references (default: 10)")
         parser.add_argument("--save-burst-frames", action=argparse.BooleanOptionalAction, default=True,
                             help="Save individual camera images as well as the average (default: enabled)")
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=1, help="Random seed for --generated-patterns only")
     parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--dry-run", action="store_true", help="Use simulated SLM and camera")
     parser.add_argument(
         "--capture-fringe-first",
         action="store_true",
-        help="Capture a full-frame pure fringe reference before adding random phase patterns",
+        help="Capture a full-frame pure fringe reference before adding modulation patterns",
     )
     parser.add_argument(
         "--confirm-fringe-preview",
         action="store_true",
         help=(
             "Open fringe previews to adjust steering, then require Y/N feedback before "
-            "random phase patterns; also enables --capture-fringe-first"
+            "modulation patterns; also enables --capture-fringe-first"
         ),
     )
-    parser.add_argument("--zernike-modes", type=positive_int, default=15)
-    parser.add_argument("--coefficient-std-rad", type=float, default=5.0)
+    parser.add_argument("--zernike-modes", type=positive_int, default=15,
+                        help="Mode count for --generated-patterns only (default: 15)")
+    parser.add_argument("--coefficient-std-rad", type=float, default=5.0,
+                        help="Coefficient standard deviation for --generated-patterns only (default: 5 rad)")
     fringe_spacing = parser.add_mutually_exclusive_group()
     fringe_spacing.add_argument(
         "--fringe-slope-rad-per-pixel",

@@ -4,10 +4,12 @@ This repository covers data collection, SLM/camera calibration, and offline
 preprocessing. Generated data, server reconstruction tools, and transfer
 utilities are kept locally and excluded from version control.
 
-`acquire_slm_camera.py` can replay the released NeuWS modulation arrays with
-`--phase-pattern-dir`. Without that option it generates random Zernike patterns
-using the existing local basis. The acquisition recipe is based on pages 3-5 of
-`sciadv.adg4671_sm.pdf`:
+`acquire_slm_camera.py` defaults to replaying the NeuWS modulation arrays in
+`data/neuws_dog_esophagus_phases/` beside the script. Install these phase files
+using [the acquisition instructions below](#4-acquire-data); missing files stop
+the run before hardware opens. Use `--phase-pattern-dir PATH` for another saved
+sequence. The legacy local random generator requires `--generated-patterns`.
+The acquisition recipe is based on pages 3-5 of `sciadv.adg4671_sm.pdf`:
 
 - HOLOEYE LETO-3 phase resolution: 1080 x 1920.
 - Vertical fringe lines with slope `4*pi/3` radians per pixel; phase varies
@@ -48,7 +50,10 @@ python -m unittest -v test_acquire_slm_camera.py test_process_measurements.py te
 
 The dry run generates realistic-sized simulated 16-bit frames and exercises
 the same pattern, preprocessing, metadata, and file-writing path as hardware
-mode. Keep the explicit test filenames in the second command: broad unittest
+mode. It needs the saved phase files, just like a hardware run. For a software
+smoke test without those data assets, explicitly add `--generated-patterns`.
+The unit tests use temporary patterns and do not need the data assets.
+Keep the explicit test filenames in the second command: broad unittest
 discovery also imports the copied vendor `HEDS` package, which expects its
 Windows SDK environment variable and therefore fails on macOS.
 
@@ -156,7 +161,7 @@ without `--heds-examples-dir`. As another supported option, copy the complete
 
 ## 4. Acquire data
 
-### Replay the released NeuWS patterns — current 633 nm experiment
+### Replay the NeuWS patterns by default — current 633 nm experiment
 
 Use the actual `proj_sim` arrays from
 `dog_esophagus_0.5diffuser/Zernike_SLM_data/SLM_sim1.mat` through `SLM_sim100.mat`.
@@ -168,11 +173,14 @@ checkout's `data/` directory, then extract it there:
 Expand-Archive data\neuws_dog_esophagus_phases.zip -DestinationPath data
 ```
 
-Alternatively, point `--phase-pattern-dir` directly at the released
+This is the default directory, resolved beside the script even when launched
+from a different working directory. Alternatively, point `--phase-pattern-dir` at the
 `Zernike_SLM_data` directory. The data source is
 [the NeuWS release](https://doi.org/10.5061/dryad.6t1g1jx42).
 The folder and ZIP are data assets excluded from git; updating the scripts alone
 does not install these phase files on another computer.
+The complete local update bundle `data/neuws_replay_acquisition_update_20261110_v2.zip`
+includes the updated scripts and this phase folder for the acquisition PC.
 
 With the current 633 nm laser, 1920x1200 SLM, P15 horizontal steering and 20 ms
 exposure, collect the fringe reference and 100 replayed patterns using:
@@ -211,13 +219,19 @@ pattern and reference. It retains full camera images for later scale-and-crop
 processing. Replaying the patterns does not establish a new 633 nm calibration
 or make the 1920x1200 SLM aspect ratio identical to the paper's 1920x1080 device.
 
-### Generated-pattern acquisition
+### Legacy generated-pattern acquisition (explicit opt-in)
+
+Use `--generated-patterns` only when you intentionally want the old local
+Zernike generator. Its basis support and normalization differ from the saved
+NeuWS sequence. Omitting this option now selects replay; the script never
+substitutes generated patterns when the replay files are missing.
 
 Close SpinView and any HOLOEYE example that has exclusive control of a device,
 then start with a short, low-risk run:
 
 ```powershell
 python acquire_slm_camera.py `
+  --generated-patterns `
   --num-patterns 3 `
   --heds-examples-dir "$HedsExamples" `
   --slm-preselect "index:0" `
@@ -230,6 +244,7 @@ sequence, for example:
 
 ```powershell
 python acquire_slm_camera.py `
+  --generated-patterns `
   --num-patterns 100 `
   --frames-per-pattern 10 `
   --seed 1 `
@@ -690,12 +705,12 @@ Useful options:
 - `--fringe-orientation vertical`: use vertical fringe lines (the default),
   with phase varying along x. Use `horizontal` to vary phase along y instead.
 
-The reference does not specify its Zernike sign/order convention, camera color
-model, or the coordinate units attached to the stated fringe slope. This
-implementation interprets the slope as radians per SLM pixel, records its
-convention and coefficients in the manifest, and keeps those choices isolated
-in `zernike_basis()`, `--fringe-slope-rad-per-pixel`, and `--pixel-format` so
-they can be adjusted without changing the acquisition loop.
+Default replay preserves the supplied phase arrays, avoiding assumptions about
+their Zernike sign, ordering, normalization, or corner support. The legacy
+`--generated-patterns` mode records its convention and coefficients in the
+manifest. Steering remains configured separately in radians per physical SLM
+pixel (or with `--fringe-period-pixels`); use the current setup's wavelength,
+SLM dimensions, and calibrated carrier as shown in the 633 nm command.
 
 ### Storage write errors
 

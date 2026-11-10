@@ -17,6 +17,7 @@ from scipy.io import loadmat, savemat
 from camera_smoke_test import make_preview_u8
 
 from acquire_slm_camera import (
+    DEFAULT_PHASE_PATTERN_DIR,
     ExperimentConfig,
     HoloeyeSLM,
     NeuWSPatternGenerator,
@@ -73,10 +74,42 @@ def test_config(seed=7):
         require_16_bit=True,
         dry_run=True,
         frames_per_pattern=1,
+        phase_pattern_dir=None,  # Legacy generation fixtures do not need external MAT files.
     )
 
 
 class PatternTests(unittest.TestCase):
+    def test_default_replay_uses_script_directory_and_explicit_source_selection(self):
+        parser = build_parser()
+        default = config_from_args(parser.parse_args([]))
+        self.assertEqual(default.phase_pattern_dir, str(DEFAULT_PHASE_PATTERN_DIR))
+        self.assertTrue(DEFAULT_PHASE_PATTERN_DIR.is_absolute())
+        generated = config_from_args(parser.parse_args(['--generated-patterns']))
+        self.assertIsNone(generated.phase_pattern_dir)
+        custom = config_from_args(parser.parse_args(['--phase-pattern-dir', 'custom_phases']))
+        self.assertEqual(custom.phase_pattern_dir, str(Path('custom_phases').resolve()))
+        with patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+            parser.parse_args(['--generated-patterns', '--phase-pattern-dir', 'custom_phases'])
+        calibration = config_from_args(build_parser(include_pattern_replay=False).parse_args([]))
+        self.assertIsNone(calibration.phase_pattern_dir)
+
+    def test_missing_default_patterns_cannot_fall_back_or_open_hardware(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (patch('acquire_slm_camera.DEFAULT_PHASE_PATTERN_DIR', root / 'missing'),
+                  patch('acquire_slm_camera.HoloeyeSLM') as slm,
+                  patch('acquire_slm_camera.PySpinCamera') as camera,
+                  patch('acquire_slm_camera.zernike_basis') as generated,
+                  patch('sys.stderr', new_callable=io.StringIO) as stderr):
+                with self.assertRaises(SystemExit) as error:
+                    main(['--output-dir', str(root / 'output')])
+                self.assertEqual(error.exception.code, 2)
+                self.assertIn('No random patterns were substituted', stderr.getvalue())
+                slm.assert_not_called()
+                camera.assert_not_called()
+                generated.assert_not_called()
+                self.assertFalse((root / 'output').exists())
+
     def test_replay_preserves_values_numeric_order_and_cached_sources(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -362,7 +395,7 @@ class PatternTests(unittest.TestCase):
 class AveragingTests(unittest.TestCase):
     def test_default_ten_frame_mean_keeps_fractional_counts_raw_frames_and_phase_identity(self):
         config = config_from_args(build_parser().parse_args([
-            "--dry-run", "--capture-fringe-first", "--num-patterns", "2",
+            "--dry-run", "--generated-patterns", "--capture-fringe-first", "--num-patterns", "2",
             "--settle-ms", "250", "--no-neuws-processing", "--output-format", "mat",
         ]))
         config = replace(config, slm_height=108, slm_width=192)
@@ -617,7 +650,7 @@ class AcquisitionSequenceTests(unittest.TestCase):
         config = config_from_args(
             parser.parse_args(
                 [
-                    "--dry-run", "--capture-fringe-first", "--num-patterns", "2",
+                    "--dry-run", "--generated-patterns", "--capture-fringe-first", "--num-patterns", "2",
                     "--frames-per-pattern", "1",
                     "--fringe-orientation", "horizontal", "--settle-ms", "300",
                     "--no-neuws-processing", "--output-format", "npy",
